@@ -116,7 +116,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
         }
         throw new AppError(404, 'NOT_FOUND', '接口不存在。');
       }
-      const staticFiles = { '/': ['public/index.html', 'text/html'], '/app.js': ['public/app.js', 'text/javascript'], '/styles.css': ['public/styles.css', 'text/css'], '/favicon.svg': ['public/favicon.svg', 'image/svg+xml'] };
+      const staticFiles = { '/': ['public/index.html', 'text/html'], '/app.js': ['public/app.js', 'text/javascript'], '/assistant-view.mjs': ['public/assistant-view.mjs', 'text/javascript'], '/styles.css': ['public/styles.css', 'text/css'], '/favicon.svg': ['public/favicon.svg', 'image/svg+xml'] };
       check(req.method === 'GET' || req.method === 'HEAD', 405, 'METHOD_NOT_ALLOWED', '不支持该方法。');
       const entry = staticFiles[path]; check(entry, 404, 'NOT_FOUND', '页面不存在。');
       const contents = await readFile(resolve(root, entry[0]));
