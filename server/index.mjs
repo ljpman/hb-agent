@@ -13,18 +13,24 @@ import { AppError, check } from './errors.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha = value => createHash('sha256').update(value).digest('hex');
 const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-async function body(req) {
+async function rawBody(req) {
   check(req.headers['content-type']?.split(';')[0] === 'application/json', 415, 'JSON_REQUIRED', '请求需使用 JSON。');
-  let text = ''; for await (const chunk of req) { text += chunk; check(Buffer.byteLength(text) <= 24000, 413, 'BODY_TOO_LARGE', '输入过长。'); }
+  const chunks = []; let size = 0;
+  for await (const chunk of req) { size += chunk.length; check(size <= 24000, 413, 'BODY_TOO_LARGE', '输入过长。'); chunks.push(chunk); }
+  return Buffer.concat(chunks).toString('utf8');
+}
+function parseBody(text) {
   try { const parsed = JSON.parse(text); check(parsed && typeof parsed === 'object' && !Array.isArray(parsed), 400, 'JSON_INVALID', '请求格式不正确。'); return parsed; }
   catch (error) { if (error instanceof AppError) throw error; throw new AppError(400, 'JSON_INVALID', '请求格式不正确。'); }
 }
+async function body(req) { return parseBody(await rawBody(req)); }
 function exportedPackage(pack, client) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>演示讲解包</title><style>body{font:16px/1.8 system-ui,sans-serif;color:#193b35;max-width:800px;margin:48px auto;padding:24px}h1{font-size:28px}h2{font-size:20px;margin-top:30px}aside{background:#fbf1df;padding:16px}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}small{color:#576961}pre{white-space:pre-wrap;font:inherit}</style><h1>方案讲解包 · 演示版</h1><aside>模拟材料，不构成保司计划书或投保建议。当前没有真实产品利益数据。以下参数来源于模拟参数确认单第 1 页。</aside><p>${escapeHtml(client.name)}（演示客户） · 方案 V${pack.job.version} · 讲解包修订 ${pack.revision}</p><table><tbody>${pack.facts.map(f => `<tr><th>${escapeHtml(f.label)}</th><td>${escapeHtml(f.value)}</td></tr>`).join('')}</tbody></table>${pack.sections.map(s => `<h2>${escapeHtml(s.title)}</h2><p>${escapeHtml(s.text)}</p>`).join('')}<h2>沟通备注</h2><pre>${escapeHtml(pack.note)}</pre><small>本次复核：${escapeHtml(pack.reviewedBy)} · ${escapeHtml(pack.reviewedAt)}<br>该导出为独立版本。后续方案变化时应重新核对。</small></html>`;
 }
 
 export function createApp({ database = process.env.HB_DATABASE || resolve(root, 'data/prototype.sqlite'), tick = true, serviceOptions = {} } = {}) {
   check(process.env.NODE_ENV !== 'production', 500, 'DEMO_ONLY', '当前是本地演示应用，禁止以 production 模式启动。');
+  check(!process.env.DIFY_API_URL && !process.env.DIFY_API_KEY, 500, 'DIFY_OFFLINE_ONLY', 'M2a-2 仅支持离线模式；真实 Dify 配置属于 M2b。');
   const registry = createAdapterRegistry({ pythonAdapterUrl: process.env.HB_PYTHON_ADAPTER_URL || null, strict: process.env.NODE_ENV === 'production' });
   const dify = createDifyClient({ apiUrl: process.env.DIFY_API_URL || null, apiKey: process.env.DIFY_API_KEY || null });
   const store = new Store(database); const service = new Service(store, { registry, dify, ...serviceOptions });
@@ -43,6 +49,20 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
       check(allowedHosts.includes(host), 403, 'LOCAL_ONLY', '该演示仅允许本机访问。');
       const url = new URL(req.url, `http://${host}`);
       const path = url.pathname;
+      // Service-to-service routes use signed capabilities, never demo cookies.
+      // Exact request target is signed, including a query string if supplied.
+      if (path.startsWith('/api/dify/')) {
+        const auditMatch = path.match(/^\/api\/dify\/tool\/compliance-audit\/([\w-]+)$/);
+        check((req.method === 'POST' && ['/api/dify/tool/compliance-audit', '/api/dify/tool/progress', '/api/dify/callback'].includes(path)) || (req.method === 'GET' && auditMatch), 404, 'NOT_FOUND', '接口不存在。');
+        const raw = req.method === 'POST' ? await rawBody(req) : '';
+        const gateway = service.difyGateway;
+        const context = gateway.authenticate(req.method, req.url, req.headers, raw);
+        if (auditMatch) return json(200, gateway.readAudit(context, auditMatch[1]));
+        const input = parseBody(raw);
+        if (path === '/api/dify/tool/compliance-audit') return json(201, gateway.compliance(context, input));
+        if (path === '/api/dify/tool/progress') return json(200, gateway.progress(context, input));
+        return json(200, gateway.callback(context, input));
+      }
       if (!['GET', 'HEAD'].includes(req.method)) check(req.headers.origin === `http://${host}`, 403, 'ORIGIN_INVALID', '请求来源不正确。');
       if (path === '/api/demo/session' && req.method === 'POST') {
         const input = await body(req); const actor = demoActors[input.actor || 'broker'];
@@ -70,8 +90,8 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
         if (path === '/api/proposal-drafts' && req.method === 'POST') return json(201, service.createDraft(actor, await body(req)));
         if (path === '/api/proposals' && req.method === 'POST') return json(202, service.createJob(actor, await body(req), req.headers['idempotency-key']));
         if (path === '/api/proposals' && req.method === 'GET') return json(200, { jobs: store.list('job', actor) });
-        if (path === '/api/extract' && req.method === 'POST') { const input = await body(req); check(input.productId === product.id, 422, 'PRODUCT_INVALID', '请选择演示产品。'); return json(200, service.extract(input.text)); }
-        if (path === '/api/assistant' && req.method === 'POST') { const input = await body(req); return json(200, service.assistant(actor, input.text, input.clientId)); }
+        if (path === '/api/extract' && req.method === 'POST') { const input = await body(req); check(input.productId === product.id, 422, 'PRODUCT_INVALID', '请选择演示产品。'); return json(200, await service.extract(input.text)); }
+        if (path === '/api/assistant' && req.method === 'POST') { const input = await body(req); return json(200, await service.assistant(actor, input.text, input.clientId)); }
         let m;
         if ((m = match(/^\/api\/clients\/([\w-]+)$/))) {
           if (req.method === 'PATCH') return json(200, service.updateClient(actor, m[1], await body(req)));

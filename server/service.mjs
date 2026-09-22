@@ -4,7 +4,8 @@ import { check, AppError } from './errors.mjs';
 import { createMockPdf } from './pdf.mjs';
 import { createAdapterRegistry } from './adapters/registry.mjs';
 import { createDifyClient } from './dify/dify-client.mjs';
-import { evaluateCompliance } from './dify/compliance.mjs';
+import { DifyGateway, saveCompliance } from './dify/gateway.mjs';
+import { LocalFallbackDifyClient } from './dify/local-fallback.mjs';
 
 const id = prefix => `${prefix}-${randomUUID()}`;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -14,7 +15,7 @@ const scope = (actor, record) => record && record.tenantId === actor.tenantId &&
 export class Service {
   constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500, registry = createAdapterRegistry(), dify = createDifyClient() } = {}) {
     this.store = store; this.now = now; this.pdf = pdf; this.stepMs = stepMs; this.registry = registry; this.dify = dify; this.busy = false;
-    this.seed(); this.recover();
+    this.seed(); this.recover(); this.difyGateway = new DifyGateway(this);
   }
   seed() {
     const samples = [
@@ -242,21 +243,27 @@ export class Service {
   assistant(actor, text, clientId) {
     if (clientId) this.get(actor, 'client', clientId);
     check(typeof text === 'string' && text.trim().length > 0 && text.length <= 3000, 422, 'TEXT_INVALID', '请输入 1–3000 字的问题。');
-    const draft = this.dify.chat({ text, product, user: this.difyUser(actor) });
+    const conversation = this.difyGateway.conversation(actor, clientId || null);
+    const draft = this.dify.chat({ text, product, user: conversation.user, conversation_id: conversation.conversation_id });
+    const finish = draft => {
+    check(draft && typeof draft.answer === 'string' && draft.answer.trim() && draft.answer.length <= 3000, 502, 'DIFY_RESULT_INVALID', '助手结果不可核实，请人工处理。');
     // Deterministic output guard runs BEFORE the reply is stored/returned.
-    const citations = draft.source ? [draft.source] : [];
-    const verdict = evaluateCompliance({ text: draft.answer, citations });
+    const local = this.dify instanceof LocalFallbackDifyClient;
+    const citations = local && draft.source ? [draft.source] : [];
+    const { audit: verdict, reply } = saveCompliance(this.store, actor, this.now, { originalText: text, draftReply: draft.answer, citations, clientId: clientId || null });
     const record = { id: id('message'), tenantId: actor.tenantId, ownerId: actor.id, clientId: clientId || null, text, createdAt: iso(this.now()), isMock: true,
-      kind: draft.kind, engine: draft.engine, compliance: { decision: verdict.decision, rules: verdict.rules, auditId: verdict.auditId } };
-    if (draft.kind === 'extraction') record.extraction = draft.extraction;
+      kind: draft.kind, engine: draft.engine, compliance: { decision: verdict.decision, rules: verdict.rules, auditId: verdict.auditId, ruleVersion: verdict.ruleVersion } };
+    if (local && draft.kind === 'extraction' && verdict.decision === 'allow') record.extraction = { ...draft.extraction, requiresConfirmation: true };
     if (verdict.decision === 'block') {
-      record.blocked = true; record.answer = '这条回复未通过合规出口检查，已转人工核对，请稍后在消息或任务中查看。'; record.source = '合规出口拦截';
+      record.blocked = true; record.answer = reply; record.source = '合规出口拦截';
     } else {
-      record.answer = draft.answer; if (draft.source) record.source = draft.source;
+      record.answer = reply; if (local && draft.source) record.source = draft.source;
     }
     this.store.put('message', record);
     this.audit(actor, verdict.decision === 'block' ? 'compliance.blocked' : 'compliance.allowed', record.id,
       `出口审查：${verdict.decision}｜命中：${verdict.rules.join('、') || '无'}`, clientId || null);
     return record;
+    };
+    return draft && typeof draft.then === 'function' ? draft.then(finish) : finish(draft);
   }
 }

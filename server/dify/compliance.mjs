@@ -1,5 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 
+export const COMPLIANCE_VERSION = 'm2a2-1';
+
 // Deterministic output guard — the last gate before any reply leaves the backend.
 // Red line: output review happens BEFORE sending (a reply streamed out and scanned
 // afterwards cannot be retracted). This layer never invents or rewrites content; it
