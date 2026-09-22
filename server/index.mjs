@@ -6,6 +6,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Store } from './store.mjs';
 import { Service } from './service.mjs';
 import { createAdapterRegistry } from './adapters/registry.mjs';
+import { createDifyClient } from './dify/dify-client.mjs';
 import { product, demoActors, demoKnowledge, statusLabels, followupStages } from './catalog.mjs';
 import { AppError, check } from './errors.mjs';
 
@@ -25,7 +26,8 @@ function exportedPackage(pack, client) {
 export function createApp({ database = process.env.HB_DATABASE || resolve(root, 'data/prototype.sqlite'), tick = true, serviceOptions = {} } = {}) {
   check(process.env.NODE_ENV !== 'production', 500, 'DEMO_ONLY', '当前是本地演示应用，禁止以 production 模式启动。');
   const registry = createAdapterRegistry({ pythonAdapterUrl: process.env.HB_PYTHON_ADAPTER_URL || null, strict: process.env.NODE_ENV === 'production' });
-  const store = new Store(database); const service = new Service(store, { registry, ...serviceOptions });
+  const dify = createDifyClient({ apiUrl: process.env.DIFY_API_URL || null, apiKey: process.env.DIFY_API_KEY || null });
+  const store = new Store(database); const service = new Service(store, { registry, dify, ...serviceOptions });
   const interval = tick ? setInterval(() => service.tick().catch(() => {}), 300) : null;
   interval?.unref();
   const server = createServer(async (req, res) => {
@@ -61,7 +63,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
           actor, isMock: true, product, clients: store.list('client', actor), jobs: store.list('job', actor),
           events: store.list('event', actor).slice(0, 60), messages: store.list('message', actor).slice(0, 50).reverse(),
           knowledge: demoKnowledge, statusLabels, followupStages,
-          integrations: { python: registry.status().python, dify: 'not-configured', im: 'prototype-only' }
+          integrations: { python: service.registry.status().python, dify: service.dify.status().dify, im: 'prototype-only' }
         });
         if (path === '/api/products' && req.method === 'GET') return json(200, { products: [product] });
         if (path === `/api/products/${product.id}/schema` && req.method === 'GET') return json(200, product);
