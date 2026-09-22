@@ -20,14 +20,16 @@
 - 鉴权下载、讲解包（经纪复核后导出）、客户跟进卡（乐观锁）、运营人工队列。
 - **执行器 adapter 抽象层（M1a 已落地）**：`InsurerAdapter` 接口 + `MockInsurerAdapter` +
   `PythonInsurerAdapter` 骨架 + registry；`isMock` 由实际运行的 adapter 诚实导出。
+- **Dify 集成地基（M2a-1 已落地）**：`DifyClient` 抽象 + 诚实降级 + 确定性**出口合规守卫**
+  `evaluateCompliance`（发送前拦截无来源数字/承诺话术/敏感字段），`assistant` 出口经此守卫并记审计。
 
 **仍是 mock / 未接入**
 - 计划书执行：仅 `MockInsurerAdapter`（本地生成显著标注的模拟 PDF）。`PythonInsurerAdapter`
   是骨架，**未连接任何真实香港端点，未声称支持任何真实保司**。
-- 参数抽取 `extract()`：本地有限规则演示，**非** LLM / Dify。
-- 知识问答 `assistant()`：演示知识边界，未接正式知识库。
-- Dify、香港 Python、真实保司门户、APP IM：全部未接入。`/api/bootstrap` 诚实返回
-  `python: awaiting-hong-kong / configured`、`dify: not-configured`、`im: prototype-only`。
+- 参数抽取 `extract()` / 知识问答 `assistant()`：经 `DifyClient` 抽象，但当前走 `LocalFallbackDifyClient`
+  本地有限规则，**非** LLM，诚实标注"未调用 Dify"。`HttpDifyClient` 是骨架，未接真实 Dify 实例。
+- 香港 Python、真实保司门户、真实 Dify 实例、知识库、APP IM：未接入。`/api/bootstrap` 诚实返回
+  `python: awaiting-hong-kong / configured`、`dify: not-configured / configured`、`im: prototype-only`。
 
 ---
 
@@ -58,7 +60,11 @@
   - **M1b**（接真实香港端点、1 社 1 产品实字段、样本核验、真实 PDF 核对）— ⏳ **待输入，未完成**。
     需要：1 社/1 产品/官方版本、入口函数与运行命令/依赖、真实字段与约束、PDF 获取方式、
     登录/MFA 方式、3–5 组"官方输入↔官方PDF"样本、`credentialRef`（不要明文密码）。
-- **M2 · 接 Dify**（意图识别、知识问答、参数抽取、合规审查）— 未开始。
+- **M2 · 接 Dify**（意图识别、知识问答、参数抽取、合规审查）
+  - **M2a-1**（DifyClient 抽象、诚实降级、确定性出口合规守卫、`assistant` 出口审查）— ✅ **已完成**。
+  - **M2a-2**（Dify 工具接口：`compliance-audit` 保存、`callback` 签名校验+去重、`progress` 骨架；
+    鉴权网关：短期令牌、后端校验身份/数据范围、`user`/`conversation_id` 后端维护映射）— 未开始。
+  - **M2b**（真实香港 Dify 实例 + DeepSeek + 三工作流 DSL 部署 + API key）— ⏳ **待环境，未开始**。
 - **M3 · 知识库**（产品条款、操作流程、合规红线、门户手册；带来源、版本、失效日期）— 未开始。
 
 映射关系（供对照，不改变上面的执行顺序）：M1 对应 [交付计划](docs/delivery-plan-v1.md) 的
@@ -87,6 +93,10 @@
   - `mock-adapter.mjs`（`MockInsurerAdapter`，演示 PDF）
   - `python-adapter.mjs`（`PythonInsurerAdapter` 骨架，说对接契约）
   - `registry.mjs`（**唯一的 mock/real 判定点**，无静默回退）
+- `server/dify/` — Dify 集成：
+  - `dify-client.mjs`（`DifyClient` 接口、`HttpDifyClient` 骨架、`createDifyClient` 工厂，key 只在后端）
+  - `local-fallback.mjs`（`LocalFallbackDifyClient`，未配置时的本地降级引擎）
+  - `compliance.mjs`（`evaluateCompliance`，**发送前的确定性出口红线守卫**）
 - `server/catalog.mjs` — 演示产品/角色/知识/状态标签。
 - `server/store.mjs` — SQLite 持久化。 `server/pdf.mjs` + `scripts/demo_pdf.py` — 模拟 PDF。
 - `server/errors.mjs` — `AppError` / `check`。 `public/` — 前端。 `tests/` — service/http/adapter 测试。
