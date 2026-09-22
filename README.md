@@ -60,7 +60,7 @@ node scripts/build_demo_pdf.mjs
 - [开发任务清单](docs/development-backlog.md)：任务编号、依赖、负责人角色和完成证据。
 - [Python 对接契约草案](docs/python-integration-contract.md)：香港现有脚本如何接入业务服务，以及模拟和真实边界。
 - [Dify 工作流实施计划](docs/dify-workflow-plan.md)：五天实施、三个工作流、接口、安全边界和验收样例。
-- [M2a-2 离线工具契约与自验收](docs/m2a2-offline-tools.md)：签名与权限、接口字段、状态／文件边界、34 项离线测试与未完成部分。
+- [M2a-2 离线工具契约与自验收](docs/m2a2-offline-tools.md)：签名与权限、接口字段、状态／文件边界、35 项离线测试与未完成部分。
 - [架构与工程评审 v2](docs/insurance-agent-v2.md)：原方案修正、接口与安全边界。
 
 执行顺序以 AGENTS.md §3 为准；工程边界沿用 v2。当前 M2a-2 离线实现已完成，真实香港链路与 Dify 部署仍待输入／环境。

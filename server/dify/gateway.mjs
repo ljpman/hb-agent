@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { check } from '../errors.mjs';
-import { evaluateCompliance, COMPLIANCE_VERSION } from './compliance.mjs';
+import { evaluateCompliance, COMPLIANCE_VERSION, hasUnverifiedNumber } from './compliance.mjs';
 
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
 export const MANUAL_REPLY = '这条回复未通过合规出口检查，已转人工核对。';
@@ -20,7 +20,7 @@ export function saveCompliance(store, actor, now, { originalText, draftReply, ci
   const verdict = evaluateCompliance({ text: draftReply, citations });
   // M2a-2 has no verified official numerical source. Tool/model-supplied source
   // labels cannot authorize numbers (including premiums and coverage amounts).
-  if (!citations.length && (/\p{N}|[%％]|百分之/u.test(draftReply) || /[零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+\s*(?:元|美元|港元|万)/.test(draftReply))) {
+  if (!citations.length && hasUnverifiedNumber(draftReply)) {
     verdict.decision = 'block';
     if (!verdict.rules.includes('unverified-number')) verdict.rules.push('unverified-number');
   }

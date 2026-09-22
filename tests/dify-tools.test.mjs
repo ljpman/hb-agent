@@ -35,6 +35,24 @@ async function setup(database = ':memory:') {
 const auditInput = cap => ({ runId: cap.runId, originalText: '产品怎么样', draftReply: '无法核实，请人工核对。' });
 const event = (cap, overrides = {}) => ({ runId: cap.runId, eventId: randomUUID(), sequence: 1, version: 1, status: 'running', ...overrides });
 
+test('中文金额与收益表述在审计、回调和助手出口均被拦截', async () => {
+  const ctx = await setup();
+  try {
+    for (const draftReply of ['现金价值八千港币', '预期收益两成', '年缴保费五千美金', '保额为壹佰萬', '退保价值为三千']) {
+      const cap = ctx.issue();
+      assert.equal((await ctx.call(cap, auditPath, { ...auditInput(cap), draftReply })).body.decision, 'block', draftReply);
+      const callback = await ctx.call(cap, callbackPath, event(cap, { status: 'succeeded', originalText: '离线审查样例', draftReply }));
+      assert.equal(callback.body.run.status, 'awaiting_manual', draftReply);
+      assert.ok(!callback.body.run.answer.includes(draftReply));
+      ctx.service.dify = { chat: () => ({ answer: draftReply, source: '自报来源不可信' }) };
+      const message = ctx.service.assistant(demoActors.broker, '离线审查样例', 'client-chen');
+      assert.equal(message.compliance.decision, 'block', draftReply);
+    }
+    const cap = ctx.issue();
+    assert.equal((await ctx.call(cap, auditPath, { ...auditInput(cap), draftReply: '请核对保费及保障责任，无法核实产品利益。' })).body.decision, 'allow');
+  } finally { await ctx.close(); }
+});
+
 test('工具网关：三个 POST 接口逐一拒绝缺令牌、过期、错误签名、时间戳、nonce、重放与缺字段', async () => {
   const ctx = await setup();
   try {
@@ -95,7 +113,7 @@ test('合规保存与查询：只存 hash、版本和判定；拒绝伪造出处
     const audit = response.body;
     assert.equal(audit.decision, 'block');
     assert.ok(audit.rules.includes('promise-language'));
-    assert.equal(audit.ruleVersion, 'm2a2-1');
+    assert.equal(audit.ruleVersion, 'm2a2-2');
     assert.equal(audit.originalHash, sha256(input.originalText));
     assert.equal(audit.draftReplyHash, sha256(input.draftReply));
     assert.notEqual(audit.replyHash, audit.draftReplyHash);

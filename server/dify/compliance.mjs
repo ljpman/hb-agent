@@ -1,6 +1,18 @@
 import { randomUUID, createHash } from 'node:crypto';
 
-export const COMPLIANCE_VERSION = 'm2a2-1';
+export const COMPLIANCE_VERSION = 'm2a2-2';
+
+// Tool/model prose has no verified numerical evidence in the offline milestone.
+// Chinese financial quantities can omit a currency/unit (e.g. 保额为壹佰萬),
+// so matching only Arabic digits or a small currency suffix list is insufficient.
+export function hasUnverifiedNumber(text) {
+  const normalized = text.normalize('NFKC');
+  const chineseNumber = /[零〇一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]/;
+  const financialContext = /收益|回报|回報|现金|現金|利益|红利|紅利|分红|分紅|派息|退保|保费|保費|保额|保額|保障金额|保障金額|赔偿|賠償|理赔|理賠|缴|繳|交费|交費|premium|cash\s*value|benefit|return|coverage|IRR/i;
+  return /\p{N}|[%％]|百分之/u.test(normalized)
+    || (financialContext.test(normalized) && chineseNumber.test(normalized))
+    || /[零〇一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+\s*(?:元|美元|港元|美金|港币|港幣|万|萬|成|倍|厘)/.test(normalized);
+}
 
 // Deterministic output guard — the last gate before any reply leaves the backend.
 // Red line: output review happens BEFORE sending (a reply streamed out and scanned
