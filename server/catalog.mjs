@@ -1,6 +1,6 @@
 export const product = {
-  id: 'demo-savings-01', name: '演示储蓄计划', insurer: '示例保司',
-  version: 'DEMO-2026.1', schemaVersion: '1', isMock: true,
+  id: 'demo-savings-01', name: '演示储蓄计划', insurer: '示例保司', insurerId: 'demo-insurer',
+  version: 'DEMO-2026.1', schemaVersion: '1', isMock: true, execution: { mode: 'mock' },
   description: '用于走查经纪工作流程。字段与范围为演示规则，尚未接入任何真实产品。',
   fields: [
     { key: 'age', label: '被保险人年龄', type: 'integer', min: 18, max: 70, required: true },

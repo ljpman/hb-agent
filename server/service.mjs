@@ -2,6 +2,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { product, demoActors, scenarios, followupStages, demoKnowledge } from './catalog.mjs';
 import { check, AppError } from './errors.mjs';
 import { createMockPdf } from './pdf.mjs';
+import { createAdapterRegistry } from './adapters/registry.mjs';
 
 const id = prefix => `${prefix}-${randomUUID()}`;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -9,8 +10,8 @@ const iso = time => new Date(time).toISOString();
 const string = (value, max = 2000) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 const scope = (actor, record) => record && record.tenantId === actor.tenantId && (actor.role === 'operator' || record.ownerId === actor.id);
 export class Service {
-  constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500 } = {}) {
-    this.store = store; this.now = now; this.pdf = pdf; this.stepMs = stepMs; this.busy = false;
+  constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500, registry = createAdapterRegistry() } = {}) {
+    this.store = store; this.now = now; this.pdf = pdf; this.stepMs = stepMs; this.registry = registry; this.busy = false;
     this.seed(); this.recover();
   }
   seed() {
@@ -101,12 +102,16 @@ export class Service {
         return already;
       }
       this.get(actor, 'client', draft.clientId);
+      // Resolve which executor runs this product; refuses a real product that has
+      // no configured adapter (no silent fallback to mock). isMock is derived here.
+      const exec = this.registry.resolveForProduct(product);
       const siblings = this.store.list('job', actor).filter(job => job.clientId === draft.clientId);
       const job = {
         id: id('job'), tenantId: actor.tenantId, ownerId: actor.id, clientId: draft.clientId, draftId: draft.id,
         params: draft.params, paramsHash: draft.paramsHash, productId: product.id, productVersion: product.version,
         version: siblings.length + 1, schemaVersion: product.schemaVersion, scenario: draft.scenario,
-        status: 'queued', isMock: true, createdAt: iso(this.now()), updatedAt: iso(this.now()),
+        execution: product.execution ?? { mode: 'mock' },
+        status: 'queued', isMock: exec.isMock, createdAt: iso(this.now()), updatedAt: iso(this.now()),
         nextAt: this.now() + this.stepMs, confirmedAt: iso(this.now()), confirmedBy: actor.name,
         history: [{ status: 'queued', at: iso(this.now()), text: '经纪已确认参数，模拟任务已接受' }]
       };
@@ -133,24 +138,29 @@ export class Service {
     try {
       const job = this.store.list('job').reverse().find(j => ['queued', 'running', 'validating'].includes(j.status) && j.nextAt <= this.now());
       if (!job) return;
-      if (!job.isMock) { this.transition(job, 'awaiting_manual', '真实执行服务尚未配置', 'ADAPTER_NOT_CONFIGURED'); return; }
-      if (job.status === 'queued') this.transition(job, 'running', '模拟服务正在准备演示文件');
-      else if (job.status === 'running') {
-        if (job.scenario === 'manual') this.transition(job, 'awaiting_manual', '模拟登录过期，已进入人工队列', 'AUTH_REQUIRED');
-        else if (job.scenario === 'failed') this.transition(job, 'failed', '模拟门户暂不可用，请新建任务重试', 'PORTAL_UNAVAILABLE');
-        else this.transition(job, 'validating', '正在核对模拟文件与确认参数');
-      } else if (job.scenario === 'mismatch') this.transition(job, 'awaiting_manual', '模拟文件参数不一致，已阻止交付', 'PDF_MISMATCH');
-      else {
-        try {
-          const bytes = await this.pdf(job);
-          check(Buffer.isBuffer(bytes) && bytes.subarray(0, 5).toString() === '%PDF-', 500, 'PDF_GENERATION_FAILED', '模拟文件生成失败');
-          this.store.transaction(() => {
-            this.store.artifact(job.id, bytes); job.artifactHash = createHash('sha256').update(bytes).digest('hex');
-            this.transition(job, 'succeeded', '模拟 PDF 已生成，输入参数与任务快照一致');
-          });
-        } catch { this.transition(job, 'failed', '模拟 PDF 生成失败，请检查本地 Python 与 reportlab 环境', 'PDF_GENERATION_FAILED'); }
+      const adapter = this.registry.resolve(job);
+      // Guard against configuration drift: the adapter that runs a job must agree
+      // with the job's recorded isMock, so a real job is never served by the mock.
+      if (!adapter || adapter.isMock !== job.isMock) {
+        this.transition(job, 'awaiting_manual', '执行器配置与任务标识不一致，已暂停', 'ADAPTER_MISMATCH'); return;
       }
+      let outcome;
+      try { outcome = await adapter.advance(job, { pdf: this.pdf }); }
+      catch { outcome = { kind: 'transition', status: 'awaiting_manual', text: '执行服务异常，结果未知，转人工核实', error: 'RESULT_UNKNOWN' }; }
+      this.applyOutcome(job, outcome);
     } finally { this.busy = false; }
+  }
+  applyOutcome(job, outcome) {
+    if (!outcome) return;
+    if (outcome.kind === 'artifact') {
+      this.store.transaction(() => {
+        this.store.artifact(job.id, outcome.bytes); job.artifactHash = createHash('sha256').update(outcome.bytes).digest('hex');
+        this.transition(job, 'succeeded', outcome.text);
+      });
+      return;
+    }
+    if (outcome.patch) Object.assign(job, outcome.patch);
+    this.transition(job, outcome.status, outcome.text, outcome.error ?? null);
   }
   readPdf(actor, jobId) {
     const job = this.get(actor, 'job', jobId);
