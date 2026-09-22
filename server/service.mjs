@@ -6,6 +6,7 @@ import { createAdapterRegistry } from './adapters/registry.mjs';
 import { createDifyClient } from './dify/dify-client.mjs';
 import { DifyGateway, saveCompliance } from './dify/gateway.mjs';
 import { LocalFallbackDifyClient } from './dify/local-fallback.mjs';
+import { evaluateCompliance, COMPLIANCE_RULES } from './dify/compliance.mjs';
 
 const id = prefix => `${prefix}-${randomUUID()}`;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -229,41 +230,43 @@ export class Service {
     } else this.transition(job, 'failed', '运营已关闭任务，请经纪重新核对后新建');
     this.audit(actor, 'operator.resolved', job.id, string(input.note), job.clientId); return job;
   }
-  difyUser(actor) {
-    // Backend-maintained internal id for Dify's `user`; never a client-supplied
-    // value and never the broker's name. Identity/scope stay in the backend.
-    return `dify-${hash({ tenantId: actor.tenantId, ownerId: actor.id }).slice(0, 24)}`;
+  checkAssistantInput(text) {
+    check(!evaluateCompliance({ text }).rules.includes(COMPLIANCE_RULES.SENSITIVE), 422, 'SENSITIVE_INPUT', '请移除凭据或敏感标识，仅通过受控凭据引用配置。');
   }
   extract(text) {
     // Extraction runs through the Dify seam; without a configured Dify it uses the
     // deliberately limited local engine and says so. Input validation stays here.
     check(typeof text === 'string' && text.length > 0 && text.length <= 3000, 422, 'TEXT_INVALID', '请输入 1–3000 字的需求。');
+    this.checkAssistantInput(text);
     return this.dify.extractParams({ text, product });
   }
   assistant(actor, text, clientId) {
     if (clientId) this.get(actor, 'client', clientId);
     check(typeof text === 'string' && text.trim().length > 0 && text.length <= 3000, 422, 'TEXT_INVALID', '请输入 1–3000 字的问题。');
+    this.checkAssistantInput(text);
     const conversation = this.difyGateway.conversation(actor, clientId || null);
     const draft = this.dify.chat({ text, product, user: conversation.user, conversation_id: conversation.conversation_id });
-    const finish = draft => {
-    check(draft && typeof draft.answer === 'string' && draft.answer.trim() && draft.answer.length <= 3000, 502, 'DIFY_RESULT_INVALID', '助手结果不可核实，请人工处理。');
-    // Deterministic output guard runs BEFORE the reply is stored/returned.
-    const local = this.dify instanceof LocalFallbackDifyClient;
-    const citations = local && draft.source ? [draft.source] : [];
-    const { audit: verdict, reply } = saveCompliance(this.store, actor, this.now, { originalText: text, draftReply: draft.answer, citations, clientId: clientId || null });
-    const record = { id: id('message'), tenantId: actor.tenantId, ownerId: actor.id, clientId: clientId || null, text, createdAt: iso(this.now()), isMock: true,
-      kind: draft.kind, engine: draft.engine, compliance: { decision: verdict.decision, rules: verdict.rules, auditId: verdict.auditId, ruleVersion: verdict.ruleVersion } };
-    if (local && draft.kind === 'extraction' && verdict.decision === 'allow') record.extraction = { ...draft.extraction, requiresConfirmation: true };
-    if (verdict.decision === 'block') {
-      record.blocked = true; record.answer = reply; record.source = '合规出口拦截';
-    } else {
-      record.answer = reply; if (local && draft.source) record.source = draft.source;
-    }
-    this.store.put('message', record);
-    this.audit(actor, verdict.decision === 'block' ? 'compliance.blocked' : 'compliance.allowed', record.id,
-      `出口审查：${verdict.decision}｜命中：${verdict.rules.join('、') || '无'}`, clientId || null);
-    return record;
-    };
+    const finish = draft => this.store.transaction(() => {
+      check(draft && typeof draft.answer === 'string' && draft.answer.trim() && draft.answer.length <= 3000, 502, 'DIFY_RESULT_INVALID', '助手结果不可核实，请人工处理。');
+      // Only backend-owned local sources/cards are currently verified. M2b needs
+      // its own deterministic evidence validation before enabling remote cards.
+      const local = this.dify instanceof LocalFallbackDifyClient;
+      const citations = local && draft.source ? [draft.source] : [];
+      const { audit: verdict, reply } = saveCompliance(this.store, actor, this.now, { originalText: text, draftReply: draft.answer, citations, clientId: clientId || null });
+      const record = { id: id('message'), tenantId: actor.tenantId, ownerId: actor.id, clientId: clientId || null, text, createdAt: iso(this.now()), isMock: true,
+        kind: local && draft.kind === 'extraction' ? 'extraction' : 'answer', engine: local ? 'local-fallback' : 'injected-test-client',
+        compliance: { decision: verdict.decision, rules: verdict.rules, auditId: verdict.auditId, ruleVersion: verdict.ruleVersion } };
+      if (local && draft.kind === 'extraction' && verdict.decision === 'allow') record.extraction = { ...draft.extraction, requiresConfirmation: true };
+      if (verdict.decision === 'block') {
+        record.blocked = true; record.answer = reply; record.source = '合规出口拦截';
+      } else {
+        record.answer = reply; if (local && draft.source) record.source = draft.source;
+      }
+      this.store.put('message', record);
+      this.audit(actor, verdict.decision === 'block' ? 'compliance.blocked' : 'compliance.allowed', record.id,
+        `出口审查：${verdict.decision}｜命中：${verdict.rules.join('、') || '无'}`, clientId || null);
+      return record;
+    });
     return draft && typeof draft.then === 'function' ? draft.then(finish) : finish(draft);
   }
 }

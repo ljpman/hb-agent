@@ -20,7 +20,7 @@ export function saveCompliance(store, actor, now, { originalText, draftReply, ci
   const verdict = evaluateCompliance({ text: draftReply, citations });
   // M2a-2 has no verified official numerical source. Tool/model-supplied source
   // labels cannot authorize numbers (including premiums and coverage amounts).
-  if (!citations.length && /[0-9０-９%％]|[零一二三四五六七八九十百千万亿两]+\s*(?:元|美元|港元|万|%|％)/.test(draftReply)) {
+  if (!citations.length && (/\p{N}|[%％]|百分之/u.test(draftReply) || /[零〇一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+\s*(?:元|美元|港元|万)/.test(draftReply))) {
     verdict.decision = 'block';
     if (!verdict.rules.includes('unverified-number')) verdict.rules.push('unverified-number');
   }

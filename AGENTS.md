@@ -22,6 +22,10 @@
   `PythonInsurerAdapter` 骨架 + registry；`isMock` 由实际运行的 adapter 诚实导出。
 - **Dify 集成地基（M2a-1 已落地）**：`DifyClient` 抽象 + 诚实降级 + 确定性**出口合规守卫**
   `evaluateCompliance`（发送前拦截无来源数字/承诺话术/敏感字段），`assistant` 出口经此守卫并记审计。
+- **M2a-2 离线工具与网关已完成**：后端短期 `actor_token`、请求签名／时间戳／持久 nonce、
+  经纪与资源范围校验、后端会话映射；合规判定与 hash 持久保存／鉴权查询；异步回调事件去重、
+  顺序／版本与终态保护；工作台展示合规结果、输入依据及待确认参数卡。详见
+  [M2a-2 契约与自验收](docs/m2a2-offline-tools.md)。
 
 **仍是 mock / 未接入**
 - 计划书执行：仅 `MockInsurerAdapter`（本地生成显著标注的模拟 PDF）。`PythonInsurerAdapter`
@@ -30,6 +34,9 @@
   本地有限规则，**非** LLM，诚实标注"未调用 Dify"。`HttpDifyClient` 是骨架，未接真实 Dify 实例。
 - 香港 Python、真实保司门户、真实 Dify 实例、知识库、APP IM：未接入。`/api/bootstrap` 诚实返回
   `python: awaiting-hong-kong / configured`、`dify: not-configured / configured`、`im: prototype-only`。
+- M2a-2 应用入口拒绝真实 Dify 环境配置，正常运行只返回 `dify: not-configured`；
+  `HttpDifyClient` 仅保留注入离线 transport 的契约测试。进度工具只返回 `not-configured`、
+  空来源／空进度；真实保单／理赔查询**未完成**。回调仅更新独立 `dify-run`，不驱动 M1 执行器。
 
 ---
 
@@ -63,7 +70,8 @@
 - **M2 · 接 Dify**（意图识别、知识问答、参数抽取、合规审查）
   - **M2a-1**（DifyClient 抽象、诚实降级、确定性出口合规守卫、`assistant` 出口审查）— ✅ **已完成**。
   - **M2a-2**（Dify 工具接口：`compliance-audit` 保存、`callback` 签名校验+去重、`progress` 骨架；
-    鉴权网关：短期令牌、后端校验身份/数据范围、`user`/`conversation_id` 后端维护映射）— 未开始。
+    鉴权网关：短期令牌、后端校验身份/数据范围、`user`/`conversation_id` 后端维护映射）— ✅ **离线部分已完成**。
+    工作台已接合规判定／参数卡／出处；34 项离线测试通过。真实进度与真实 Dify 部署仍未完成。
   - **M2b**（真实香港 Dify 实例 + DeepSeek + 三工作流 DSL 部署 + API key）— ⏳ **待环境，未开始**。
 - **M3 · 知识库**（产品条款、操作流程、合规红线、门户手册；带来源、版本、失效日期）— 未开始。
 
@@ -97,6 +105,9 @@
   - `dify-client.mjs`（`DifyClient` 接口、`HttpDifyClient` 骨架、`createDifyClient` 工厂，key 只在后端）
   - `local-fallback.mjs`（`LocalFallbackDifyClient`，未配置时的本地降级引擎）
   - `compliance.mjs`（`evaluateCompliance`，**发送前的确定性出口红线守卫**）
+  - `gateway.mjs`（后端令牌签发、持久会话／nonce、合规审计、进度骨架、独立回调状态机）
+- `public/assistant-view.mjs` — 合规状态、审查详情、输入依据与待确认参数卡；block 隐藏动作。
+- `tests/dify-tools.test.mjs` / `tests/assistant-view.test.mjs` — 离线 HTTP 安全矩阵、重启／并发／回滚、前端渲染。
 - `server/catalog.mjs` — 演示产品/角色/知识/状态标签。
 - `server/store.mjs` — SQLite 持久化。 `server/pdf.mjs` + `scripts/demo_pdf.py` — 模拟 PDF。
 - `server/errors.mjs` — `AppError` / `check`。 `public/` — 前端。 `tests/` — service/http/adapter 测试。

@@ -7,6 +7,7 @@ import { Store } from '../server/store.mjs';
 import { evaluateCompliance, COMPLIANCE_RULES } from '../server/dify/compliance.mjs';
 import { createDifyClient, HttpDifyClient } from '../server/dify/dify-client.mjs';
 import { LocalFallbackDifyClient } from '../server/dify/local-fallback.mjs';
+import { spawnSync } from 'node:child_process';
 
 function serviceWith(dify) {
   let clock = Date.parse('2026-09-22T01:00:00.000Z');
@@ -22,6 +23,33 @@ test('出口守卫：无来源收益数字被拦截（模型不产数字的出�
   // 同样的数字，只要有出处即可放行。
   const ok = evaluateCompliance({ text: '根据官方计划书第 3 页，现金价值为 12,345。', citations: ['官方计划书 · 第 3 页'] });
   assert.equal(ok.decision, 'allow');
+});
+
+test('M2a-2 应用入口拒绝真实 Dify 环境配置，未发起网络调用', () => {
+  const script = `import { createApp } from './server/index.mjs';
+    globalThis.fetch = () => { throw new Error('NETWORK_FORBIDDEN'); };
+    try { createApp({database: ':memory:', tick: false}); process.exitCode = 1; }
+    catch (error) { if (error.code !== 'DIFY_OFFLINE_ONLY') process.exitCode = 2; }`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, NODE_ENV: 'test', DIFY_API_URL: 'https://unconfigured.invalid', DIFY_API_KEY: 'offline-test-value' }, encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('助手凭据输入在进入客户端和消息存储前拒绝；审计与消息原子写入', () => {
+  const { service, store } = serviceWith(createDifyClient());
+  try {
+    for (const text of ['password=demo-value', 'api_key=demo-value', 'Cookie=demo-value']) {
+      assert.throws(() => service.assistant(demoActors.broker, text, null), e => e.code === 'SENSITIVE_INPUT');
+      assert.throws(() => service.extract(text), e => e.code === 'SENSITIVE_INPUT');
+    }
+    assert.equal(store.list('message').length, 0);
+    const put = store.put.bind(store);
+    store.put = (kind, record) => { if (kind === 'message') throw new Error('Injected database failure'); return put(kind, record); };
+    assert.throws(() => service.assistant(demoActors.broker, '如何生成', null));
+    assert.equal(store.list('compliance-audit').length, 0);
+    assert.equal(store.list('event').length, 0);
+  } finally { store.close(); }
 });
 
 test('出口守卫：承诺话术与敏感字段被拦截，正常回复放行', () => {

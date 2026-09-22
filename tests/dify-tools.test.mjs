@@ -110,12 +110,65 @@ test('合规保存与查询：只存 hash、版本和判定；拒绝伪造出处
     for (const extra of [{ citations: ['官方PDF'] }, { decision: 'allow' }, { ruleVersion: 'fake' }]) {
       assert.equal((await ctx.call(cap, auditPath, { ...input, ...extra })).status, 422);
     }
-    for (const draftReply of ['保费为 10000 美元', '保障金额为一万元', '回报率１２％']) {
+    for (const draftReply of ['保费为 10000 美元', '保障金额为一万元', '回报率１２％', '收益百分之八', '保费壹万元']) {
       assert.equal((await ctx.call(cap, auditPath, { ...auditInput(cap), draftReply })).body.decision, 'block');
     }
     const allowed = (await ctx.call(cap, auditPath, auditInput(cap))).body;
     assert.equal(allowed.decision, 'allow');
     assert.equal(allowed.replyHash, allowed.draftReplyHash);
+  } finally { await ctx.close(); }
+});
+
+test('审计 GET：过期、签名、nonce 与重放同样受网关保护', async () => {
+  const ctx = await setup();
+  try {
+    const cap = ctx.issue();
+    const audit = (await ctx.call(cap, auditPath, auditInput(cap))).body;
+    const path = `${auditPath}/${audit.auditId}`;
+    const request = ctx.signed(cap, path, null, { method: 'GET' });
+    assert.equal((await ctx.request(path, request)).status, 200);
+    assert.equal((await ctx.request(path, request)).body.error.code, 'REPLAY');
+    const bad = ctx.signed(cap, path, null, { method: 'GET' });
+    delete bad.headers['x-dify-signature'];
+    assert.equal((await ctx.request(path, bad)).status, 401);
+    const noNonce = ctx.signed(cap, path, null, { method: 'GET' });
+    delete noNonce.headers['x-dify-nonce'];
+    assert.equal((await ctx.request(path, noNonce)).status, 401);
+    ctx.advance(60001);
+    assert.equal((await ctx.request(path, ctx.signed(cap, path, null, { method: 'GET', timestamp: 1790000000000 }))).status, 401);
+    ctx.advance(240000);
+    assert.equal((await ctx.call(cap, path, null, { method: 'GET' })).body.error.code, 'TOKEN_EXPIRED');
+  } finally { await ctx.close(); }
+});
+
+test('HTTP 助手：后端会话映射、异步出口、伪造出处／卡片隔离，令牌不进浏览器', async () => {
+  const ctx = await setup();
+  try {
+    const session = await fetch(`${ctx.origin}/api/demo/session`, { method: 'POST', headers: { origin: ctx.origin, 'content-type': 'application/json' }, body: JSON.stringify({ actor: 'broker' }) });
+    const cookie = session.headers.get('set-cookie');
+    const calls = [];
+    ctx.service.dify = { status: () => ({ dify: 'not-configured' }), chat: async input => { calls.push(input); return { kind: 'extraction', engine: 'secret', answer: '年缴保费 9000 美元', source: '伪造官方PDF', extraction: { params: { annualPremium: '9000' } } }; } };
+    const send = input => ctx.request('/api/assistant', { method: 'POST', headers: { cookie, origin: ctx.origin, 'content-type': 'application/json' }, body: JSON.stringify(input) });
+    const input = { text: '问题', clientId: 'client-chen', user: 'fake-user', conversation_id: 'fake-conversation' };
+    const result = await send(input);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.compliance.decision, 'block');
+    assert.equal(result.body.extraction, undefined);
+    assert.ok(!JSON.stringify(result.body).includes('9000'));
+    await send(input);
+    assert.equal(calls[0].user, calls[1].user);
+    assert.equal(calls[0].conversation_id, calls[1].conversation_id);
+    assert.notEqual(calls[0].user, input.user);
+    assert.notEqual(calls[0].conversation_id, input.conversation_id);
+    const boot = await ctx.request('/api/bootstrap', { headers: { cookie } });
+    assert.equal(boot.status, 200);
+    assert.ok(!JSON.stringify(boot.body).includes('actor_token'));
+    assert.ok(!JSON.stringify(boot.body).includes('dify-conversation'));
+    assert.equal((await ctx.request('/api/dify/token', { method: 'POST' })).status, 404);
+    const asset = await fetch(ctx.origin + '/assistant-view.mjs');
+    assert.equal(asset.status, 200);
+    assert.match(asset.headers.get('content-type'), /javascript/);
+    assert.match(await asset.text(), /renderAssistantReply/);
   } finally { await ctx.close(); }
 });
 
@@ -208,4 +261,26 @@ test('重启：会话映射、令牌、nonce、事件、合规与终态在 SQLit
     assert.equal((await ctx.call(cap, callbackPath, event(cap, { sequence: 2 }))).body.reason, 'terminal');
     assert.equal((await ctx.call(cap, `${auditPath}/${saved.compliance.auditId}`, null, { method: 'GET' })).body.auditId, saved.compliance.auditId);
   } finally { await ctx.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('并发回调只接受一次；持久化失败回滚事件和审计，允许新 nonce 重试', async () => {
+  const ctx = await setup();
+  try {
+    const cap = ctx.issue();
+    assert.throws(() => ctx.issue(demoActors.broker, { ttlMs: 300001 }), e => e.code === 'TTL_INVALID');
+    const input = event(cap, { status: 'succeeded', originalText: '问题', draftReply: '请核对参数。' });
+    const signed = ctx.signed(cap, callbackPath, input);
+    const responses = await Promise.all([ctx.request(callbackPath, signed), ctx.request(callbackPath, signed)]);
+    assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+    const retry = ctx.issue();
+    const result = event(retry, { status: 'succeeded', originalText: '问题', draftReply: '请核对参数。' });
+    const put = ctx.store.put.bind(ctx.store);
+    ctx.store.put = (kind, record) => { if (kind === 'dify-run') throw new Error('Injected database failure'); return put(kind, record); };
+    assert.equal((await ctx.call(retry, callbackPath, result)).status, 500);
+    ctx.store.put = put;
+    assert.equal(ctx.store.get('dify-run', retry.runId).status, 'queued');
+    assert.equal(ctx.store.list('compliance-audit').filter(a => a.runId === retry.runId).length, 0);
+    assert.equal((await ctx.call(retry, callbackPath, result)).body.accepted, true);
+    assert.equal(ctx.store.list('compliance-audit').filter(a => a.runId === retry.runId).length, 1);
+  } finally { await ctx.close(); }
 });
