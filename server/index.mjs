@@ -65,7 +65,8 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
       }
       if (!['GET', 'HEAD'].includes(req.method)) check(req.headers.origin === `http://${host}`, 403, 'ORIGIN_INVALID', '请求来源不正确。');
       if (path === '/api/demo/session' && req.method === 'POST') {
-        const input = await body(req); const actor = demoActors[input.actor || 'broker'];
+        const input = await body(req); const name = input.actor ?? 'broker';
+        const actor = typeof name === 'string' && Object.hasOwn(demoActors, name) ? demoActors[name] : null;
         check(actor, 422, 'ACTOR_INVALID', '演示身份不存在。');
         const token = randomBytes(32).toString('hex');
         store.db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
@@ -80,7 +81,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
         const actor = JSON.parse(session.actor);
         const match = pattern => path.match(pattern);
         if (path === '/api/bootstrap' && req.method === 'GET') return json(200, {
-          actor, isMock: true, product, clients: store.list('client', actor), jobs: store.list('job', actor),
+          actor, isMock: true, product, productAvailability: service.productAvailability(actor), clients: store.list('client', actor), jobs: store.list('job', actor),
           events: store.list('event', actor).slice(0, 60), messages: store.list('message', actor).slice(0, 50).reverse(),
           knowledge: demoKnowledge, statusLabels, followupStages,
           integrations: { python: service.registry.status().python, dify: service.dify.status().dify, im: 'prototype-only' }
@@ -90,9 +91,18 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
         if (path === '/api/proposal-drafts' && req.method === 'POST') return json(201, service.createDraft(actor, await body(req)));
         if (path === '/api/proposals' && req.method === 'POST') return json(202, service.createJob(actor, await body(req), req.headers['idempotency-key']));
         if (path === '/api/proposals' && req.method === 'GET') return json(200, { jobs: store.list('job', actor) });
-        if (path === '/api/extract' && req.method === 'POST') { const input = await body(req); check(input.productId === product.id, 422, 'PRODUCT_INVALID', '请选择演示产品。'); return json(200, await service.extract(input.text)); }
+        if (path === '/api/extract' && req.method === 'POST') {
+          const input = await body(req);
+          check(input.productId === product.id, 422, 'PRODUCT_INVALID', '请选择演示产品。');
+          check(input.schemaVersion === product.schemaVersion, 409, 'SCHEMA_CHANGED', '产品字段版本已变化，请重新读取字段定义。');
+          return json(200, await service.extract(input.text));
+        }
         if (path === '/api/assistant' && req.method === 'POST') { const input = await body(req); return json(200, await service.assistant(actor, input.text, input.clientId)); }
         let m;
+        if ((m = match(/^\/api\/products\/([\w-]+)\/availability$/))) {
+          if (req.method === 'GET') return json(200, service.productAvailability(actor, m[1]));
+          if (req.method === 'PATCH') return json(200, service.setProductAvailability(actor, m[1], await body(req)));
+        }
         if ((m = match(/^\/api\/clients\/([\w-]+)$/))) {
           if (req.method === 'PATCH') return json(200, service.updateClient(actor, m[1], await body(req)));
           if (req.method === 'GET') return json(200, { client: service.get(actor, 'client', m[1]), jobs: store.list('job', actor).filter(j => j.clientId === m[1]), events: store.list('event', actor).filter(e => e.clientId === m[1]) });
@@ -116,7 +126,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
         }
         throw new AppError(404, 'NOT_FOUND', '接口不存在。');
       }
-      const staticFiles = { '/': ['public/index.html', 'text/html'], '/app.js': ['public/app.js', 'text/javascript'], '/assistant-view.mjs': ['public/assistant-view.mjs', 'text/javascript'], '/styles.css': ['public/styles.css', 'text/css'], '/favicon.svg': ['public/favicon.svg', 'image/svg+xml'] };
+      const staticFiles = { '/': ['public/index.html', 'text/html'], '/app.js': ['public/app.js', 'text/javascript'], '/assistant-view.mjs': ['public/assistant-view.mjs', 'text/javascript'], '/product-control.mjs': ['public/product-control.mjs', 'text/javascript'], '/styles.css': ['public/styles.css', 'text/css'], '/favicon.svg': ['public/favicon.svg', 'image/svg+xml'] };
       check(req.method === 'GET' || req.method === 'HEAD', 405, 'METHOD_NOT_ALLOWED', '不支持该方法。');
       const entry = staticFiles[path]; check(entry, 404, 'NOT_FOUND', '页面不存在。');
       const contents = await readFile(resolve(root, entry[0]));

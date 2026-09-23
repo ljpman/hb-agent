@@ -33,11 +33,13 @@ const ERROR_OUTCOMES = {
   [ERROR.WORKER_LOST]: { status: STATUS.awaiting_manual, text: '执行进程丢失，正在恢复／需人工', error: ERROR.WORKER_LOST },
 };
 
-async function fetchTransport(endpoint, request) {
+async function fetchTransport(endpoint, request, { signal } = {}) {
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(request),
+    signal,
+    redirect: 'error',
   });
   if (!response.ok) {
     const error = new Error(`HTTP ${response.status}`);
@@ -51,6 +53,7 @@ export class PythonInsurerAdapter {
   isMock = false;
 
   constructor({ endpoint = null, transport = fetchTransport, contractVersion = '1', timeoutMs = 120000 } = {}) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) throw new TypeError('timeoutMs must be a positive bounded integer');
     this.endpoint = endpoint;
     this.transport = transport;
     this.contractVersion = contractVersion;
@@ -64,7 +67,7 @@ export class PythonInsurerAdapter {
     return {
       contractVersion: this.contractVersion,
       jobId: job.id,
-      attemptId: `${job.id}-attempt-${randomUUID()}`,
+      attemptId: job.executionAttempt?.id ?? `${job.id}-attempt-${randomUUID()}`,
       productId: job.productId,
       productVersion: job.productVersion,
       schemaVersion: job.schemaVersion,
@@ -76,7 +79,7 @@ export class PythonInsurerAdapter {
     };
   }
 
-  async advance(job) {
+  async advance(job, { signal } = {}) {
     if (!this.endpoint) {
       return { kind: 'transition', status: STATUS.awaiting_manual, text: '真实执行服务尚未配置', error: ERROR.ADAPTER_NOT_CONFIGURED };
     }
@@ -85,20 +88,47 @@ export class PythonInsurerAdapter {
     }
     if (job.status === STATUS.running) {
       let result;
+      const request = this.buildRequest(job);
+      const controller = new AbortController();
+      let timer, cancel;
       try {
-        result = await this.transport(this.endpoint, this.buildRequest(job));
+        // Bound even injected transports that ignore AbortSignal. An uncertain
+        // submission is never retried automatically, including a late response.
+        result = await Promise.race([
+          Promise.resolve().then(() => this.transport(this.endpoint, request, { signal: controller.signal })),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => { controller.abort(); reject(new Error('Execution deadline exceeded')); }, this.timeoutMs);
+          }),
+          new Promise((_, reject) => {
+            cancel = () => { controller.abort(); reject(new Error('Execution lease lost')); };
+            if (signal?.aborted) cancel();
+            else signal?.addEventListener('abort', cancel, { once: true });
+          }),
+        ]);
       } catch {
         // Uncertain result: do not blindly retry a real portal task.
         return { kind: 'transition', status: STATUS.awaiting_manual, text: '调用执行服务失败，结果未知，转人工核实', error: ERROR.RESULT_UNKNOWN };
-      }
-      if (result && result.error) {
-        const mapped = ERROR_OUTCOMES[result.error] ?? { status: STATUS.awaiting_manual, text: '未知错误，已转人工', error: ERROR.RESULT_UNKNOWN };
-        return { kind: 'transition', ...mapped };
+      } finally {
+        clearTimeout(timer);
+        if (cancel) signal?.removeEventListener('abort', cancel);
       }
       // A real service must never silently hand back a mock result.
       if (result && result.isMock === true) {
         return { kind: 'transition', status: STATUS.awaiting_manual, text: '真实执行服务返回了模拟标识，已阻止交付', error: ERROR.ADAPTER_MISMATCH };
       }
+      // Bind every response (including errors) to this exact submission before
+      // using it. Never persist arbitrary remote metadata, messages or URLs.
+      const unknown = { kind: 'transition', status: STATUS.awaiting_manual, text: '执行结果无法与本次任务可靠对应，转人工核实', error: ERROR.RESULT_UNKNOWN };
+      if (!result || Array.isArray(result) || result.jobId !== request.jobId || result.attemptId !== request.attemptId || result.isMock !== false) return unknown;
+      if (result.error) {
+        const mapped = Object.hasOwn(ERROR_OUTCOMES, result.error) ? ERROR_OUTCOMES[result.error] : ERROR_OUTCOMES[ERROR.RESULT_UNKNOWN];
+        return { kind: 'transition', ...mapped };
+      }
+      const source = result.source;
+      const reference = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/.test(value);
+      if (result.status !== STATUS.validating || !reference(result.artifactRef) || !source ||
+          !reference(source.insurerId) || source.productId !== job.productId || source.productVersion !== job.productVersion ||
+          (job.execution?.insurerId && source.insurerId !== job.execution.insurerId)) return unknown;
       // Candidate obtained but not yet verifiable → hold in validating and keep
       // the official source / validation metadata for review.
       return {
@@ -106,9 +136,9 @@ export class PythonInsurerAdapter {
         status: STATUS.validating,
         text: '已取得候选文件，等待核验',
         patch: {
-          source: result?.source ?? null,
-          validation: result?.validation ?? null,
-          artifactRef: result?.artifactRef ?? null,
+          source: { insurerId: source.insurerId, productId: source.productId, productVersion: source.productVersion },
+          validation: { status: 'pending', mismatches: [] },
+          artifactRef: result.artifactRef,
         },
       };
     }

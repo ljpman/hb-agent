@@ -10,11 +10,18 @@ import { evaluateCompliance, COMPLIANCE_RULES } from './dify/compliance.mjs';
 
 const id = prefix => `${prefix}-${randomUUID()}`;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const confirmationHash = (snapshot, params) => hash({ productId: snapshot.id, productVersion: snapshot.version,
+  schemaVersion: snapshot.schemaVersion, productSnapshotHash: hash(snapshot), params });
 const iso = time => new Date(time).toISOString();
 const string = (value, max = 2000) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 const scope = (actor, record) => record && record.tenantId === actor.tenantId && (actor.role === 'operator' || record.ownerId === actor.id);
+// credentialRef is a backend-managed account identity, never a password. Jobs
+// without a mapped reference share a conservative global execution slot.
+const executionResource = job => hash({ credentialRef: job.credentialRef || 'unconfigured-python-account' });
 export class Service {
-  constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500, registry = createAdapterRegistry(), dify = createDifyClient() } = {}) {
+  constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500, registry = createAdapterRegistry(), dify = createDifyClient(), leaseMs = 30000 } = {}) {
+    check(Number.isSafeInteger(leaseMs) && leaseMs >= 30 && leaseMs <= 3600000, 500, 'LEASE_CONFIG_INVALID', '任务租约时长配置无效。');
+    this.workerId = id('worker'); this.leaseMs = leaseMs;
     this.store = store; this.now = now; this.pdf = pdf; this.stepMs = stepMs; this.registry = registry; this.dify = dify; this.busy = false;
     this.seed(); this.recover(); this.difyGateway = new DifyGateway(this);
   }
@@ -42,7 +49,7 @@ export class Service {
       actorName: actor.name, type, subjectId, clientId, detail, createdAt: iso(this.now()) });
   }
   eventForJob(job, type, detail) {
-    this.audit({ id: job.ownerId, tenantId: job.tenantId, name: '模拟执行服务' }, type, job.id, detail, job.clientId);
+    this.audit({ id: job.ownerId, tenantId: job.tenantId, name: job.isMock ? '模拟执行服务' : '计划书执行服务' }, type, job.id, detail, job.clientId);
   }
   validate(params) {
     check(params && typeof params === 'object' && !Array.isArray(params), 422, 'PARAM_INVALID', '请填写参数。');
@@ -65,23 +72,50 @@ export class Service {
         if (!/^\d{1,7}(\.\d{1,2})?$/.test(raw)) { errors[field.key] = '请输入最多两位小数的金额'; continue; }
         const [whole, fraction = ''] = raw.split('.');
         const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
-        if (cents < 100000n || cents > 100000000n) errors[field.key] = '演示年缴保费范围为 1,000–1,000,000';
+        const bound = amount => { const [whole, fraction = ''] = amount.split('.'); return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0')); };
+        if (cents < bound(field.min) || cents > bound(field.max)) errors[field.key] = `演示${field.label}范围为 ${field.min}–${field.max}`;
         else normalized[field.key] = `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
       }
     }
     check(Object.keys(errors).length === 0, 422, 'PARAM_INVALID', '请补充或修改标出的参数。', errors);
     return normalized;
   }
+  productAvailability(actor, productId = product.id) {
+    check(productId === product.id, 404, 'PRODUCT_INVALID', '产品不存在。');
+    const record = this.store.get('product-control', hash({ tenantId: actor.tenantId, productId }));
+    return record ? { productId, paused: record.paused, revision: record.revision, reason: record.reason, updatedAt: record.updatedAt }
+      : { productId, paused: false, revision: 0, reason: '', updatedAt: null };
+  }
+  assertProductAvailable(actor, productId = product.id) {
+    check(!this.productAvailability(actor, productId).paused, 409, 'PRODUCT_PAUSED', '该产品已暂停，请联系运营核实后再提交。');
+  }
+  setProductAvailability(actor, productId, input) {
+    check(actor.role === 'operator', 403, 'ROLE_REQUIRED', '只有运营身份可以暂停或恢复产品。');
+    check(typeof input.paused === 'boolean' && typeof input.reason === 'string' && input.reason.trim().length >= 2 && input.reason.length <= 300,
+      422, 'CONTROL_INVALID', '请选择产品状态并填写 2–300 字处理原因。');
+    this.checkAssistantInput(input.reason);
+    return this.store.transaction(() => {
+      const current = this.productAvailability(actor, productId);
+      check(current.revision === input.revision, 409, 'VERSION_CONFLICT', '产品状态已更新，请刷新后处理。');
+      this.store.put('product-control', { id: hash({ tenantId: actor.tenantId, productId }), tenantId: actor.tenantId, ownerId: actor.id,
+        productId, paused: input.paused, reason: input.reason.trim(), revision: current.revision + 1, updatedAt: iso(this.now()) });
+      this.audit(actor, input.paused ? 'product.paused' : 'product.resumed', productId, input.reason.trim());
+      return this.productAvailability(actor, productId);
+    });
+  }
   createDraft(actor, input) {
     const client = this.get(actor, 'client', input.clientId);
     check(actor.role === 'broker', 403, 'ROLE_REQUIRED', '请使用经纪身份创建方案。');
     check(input.productId === product.id && input.schemaVersion === product.schemaVersion, 409, 'SCHEMA_CHANGED', '产品字段版本已变化，请重新打开表单。');
+    this.assertProductAvailable(actor, input.productId);
     const params = this.validate(input.params);
     const scenario = input.scenario || 'success';
     check(scenarios.includes(scenario), 422, 'SCENARIO_INVALID', '演示场景不正确。');
+    const productSnapshot = structuredClone(product);
     const draft = { id: id('draft'), tenantId: actor.tenantId, ownerId: actor.id, clientId: client.id,
       productId: product.id, productVersion: product.version, schemaVersion: product.schemaVersion,
-      params, paramsHash: hash({ productId: product.id, schemaVersion: product.schemaVersion, params }),
+      productSnapshot, productSnapshotHash: hash(productSnapshot),
+      params, paramsHash: confirmationHash(productSnapshot, params),
       revision: 1, scenario, createdAt: iso(this.now()), expiresAt: iso(this.now() + 30 * 60000) };
     this.store.put('draft', draft); return draft;
   }
@@ -98,13 +132,18 @@ export class Service {
       const draft = this.get(actor, 'draft', input.draftId);
       check(draft.revision === input.revision && draft.paramsHash === input.paramsHash, 409, 'CONFIRMATION_CHANGED', '参数已变化，请重新确认。');
       check(Date.parse(draft.expiresAt) > this.now(), 409, 'CONFIRMATION_EXPIRED', '确认页已过期，请重新检查参数。');
-      check(draft.schemaVersion === product.schemaVersion, 409, 'SCHEMA_CHANGED', '产品字段版本已变化。');
+      check(draft.productSnapshot && draft.productSnapshotHash, 409, 'SCHEMA_CHANGED', '确认记录缺少完整产品版本，请重新打开表单。');
+      check(draft.productSnapshotHash === hash(draft.productSnapshot) && draft.paramsHash === confirmationHash(draft.productSnapshot, draft.params),
+        409, 'CONFIRMATION_CHANGED', '确认快照完整性核对失败，请重新确认。');
+      check(draft.productId === product.id && draft.productVersion === product.version && draft.schemaVersion === product.schemaVersion &&
+        draft.productSnapshotHash === hash(product), 409, 'SCHEMA_CHANGED', '产品版本或字段规则已变化，请重新确认。');
       check(input.confirmed === true, 422, 'CONFIRMATION_REQUIRED', '请先勾选参数确认。');
       const already = this.store.list('job', actor).find(job => job.draftId === draft.id);
       if (already) {
         this.store.db.prepare('INSERT INTO idempotency VALUES(?,?,?,?,?)').run(actor.tenantId, actor.id, key, requestHash, already.id);
         return already;
       }
+      this.assertProductAvailable(actor, draft.productId);
       this.get(actor, 'client', draft.clientId);
       // Resolve which executor runs this product; refuses a real product that has
       // no configured adapter (no silent fallback to mock). isMock is derived here.
@@ -112,9 +151,10 @@ export class Service {
       const siblings = this.store.list('job', actor).filter(job => job.clientId === draft.clientId);
       const job = {
         id: id('job'), tenantId: actor.tenantId, ownerId: actor.id, clientId: draft.clientId, draftId: draft.id,
-        params: draft.params, paramsHash: draft.paramsHash, productId: product.id, productVersion: product.version,
-        version: siblings.length + 1, schemaVersion: product.schemaVersion, scenario: draft.scenario,
-        execution: product.execution ?? { mode: 'mock' },
+        params: draft.params, paramsHash: draft.paramsHash, productId: draft.productId, productVersion: draft.productVersion,
+        productSnapshot: structuredClone(draft.productSnapshot), productSnapshotHash: draft.productSnapshotHash,
+        version: siblings.length + 1, schemaVersion: draft.schemaVersion, scenario: draft.scenario,
+        execution: structuredClone(draft.productSnapshot.execution ?? { mode: 'mock' }),
         status: 'queued', isMock: exec.isMock, createdAt: iso(this.now()), updatedAt: iso(this.now()),
         nextAt: this.now() + this.stepMs, confirmedAt: iso(this.now()), confirmedBy: actor.name,
         history: [{ status: 'queued', at: iso(this.now()), text: '经纪已确认参数，模拟任务已接受' }]
@@ -125,51 +165,148 @@ export class Service {
       return job;
     });
   }
-  transition(job, status, text, error = null) {
+  persistTransition(job, status, text, error = null) {
     job.status = status; job.updatedAt = iso(this.now()); job.nextAt = this.now() + this.stepMs; job.error = error;
     job.history.push({ status, at: job.updatedAt, text }); this.store.put('job', job);
     this.eventForJob(job, `proposal.${status}`, text);
   }
+  transition(job, status, text, error = null, patch = {}) {
+    // State and its audit evidence must either both persist or both roll back.
+    // Work on a copy so a failed transaction cannot leave the caller mutated.
+    const next = { ...structuredClone(job), ...patch };
+    this.store.transaction(() => this.persistTransition(next, status, text, error));
+    Object.assign(job, next);
+  }
   recover() {
     // Only local, side-effect-free mock work can be safely resumed automatically.
-    for (const job of this.store.list('job')) {
-      if (!job.isMock && ['running', 'validating'].includes(job.status)) this.transition(job, 'awaiting_manual', '执行中断，需先核实门户结果', 'RESULT_UNKNOWN');
-      else if (job.isMock && ['queued', 'running', 'validating'].includes(job.status)) { job.nextAt = this.now(); this.store.put('job', job); }
-    }
+    this.store.transaction(() => {
+      for (const job of this.store.list('job')) {
+        const lease = this.store.lease(job.id);
+        if (lease && lease.expires > this.now()) continue;
+        if (!job.isMock && ['running', 'validating'].includes(job.status)) this.persistTransition(job, 'awaiting_manual', '执行中断，需先核实门户结果', 'RESULT_UNKNOWN');
+        else if (job.isMock && ['queued', 'running', 'validating'].includes(job.status)) { job.nextAt = this.now(); this.store.put('job', job); }
+        if (lease) this.store.releaseLease(lease);
+      }
+    });
+  }
+  claimWork() {
+    return this.store.transaction(() => {
+      const now = this.now();
+      for (const job of this.store.list('job').reverse()) {
+        if (!['queued', 'running', 'validating'].includes(job.status) || job.nextAt > now) continue;
+        const previous = this.store.lease(job.id);
+        if (previous && previous.expires > now) continue;
+        if (job.status === 'queued' && job.productId === product.id && this.productAvailability(job, job.productId).paused) {
+          this.persistTransition(job, 'awaiting_manual', '产品已暂停，排队任务停止执行，等待运营核实', 'PRODUCT_PAUSED');
+          if (previous) this.store.releaseLease(previous);
+          continue;
+        }
+        // An expired real execution, or a durable submission with no outcome,
+        // is uncertain. Never submit it again, even without a process restart.
+        if (!job.isMock && ((previous && ['running', 'validating'].includes(job.status)) ||
+            (job.status === 'running' && job.executionAttempt))) {
+          this.persistTransition(job, 'awaiting_manual', '执行租约失效或结果未落库，需核实门户结果', 'RESULT_UNKNOWN');
+          if (previous) this.store.releaseLease(previous);
+          continue;
+        }
+        if (!job.isMock && ['queued', 'running'].includes(job.status)) {
+          const resource = this.store.db.prepare('SELECT job_id FROM execution_resources WHERE resource_key=?').get(executionResource(job));
+          if (resource && resource.job_id !== job.id) continue;
+        }
+        const lease = { job_id: job.id, owner: this.workerId, token: randomUUID(), expires: now + this.leaseMs, heartbeat: now };
+        this.store.db.prepare('INSERT OR REPLACE INTO job_leases VALUES(?,?,?,?,?)').run(lease.job_id, lease.owner, lease.token, lease.expires, lease.heartbeat);
+        if (!job.isMock && job.status === 'running') {
+          this.store.db.prepare('INSERT OR IGNORE INTO execution_resources VALUES(?,?,?)').run(executionResource(job), job.id, now);
+          job.executionAttempt = { id: `${job.id}-attempt-${randomUUID()}`, startedAt: iso(now) };
+          this.store.put('job', job);
+          this.eventForJob(job, 'proposal.execution-started', '执行尝试已持久记录，结果未知时不自动重提');
+        }
+        return { job, lease };
+      }
+      return null;
+    });
   }
   async tick() {
     if (this.busy) return; this.busy = true;
+    let claimed, heartbeat;
     try {
-      const job = this.store.list('job').reverse().find(j => ['queued', 'running', 'validating'].includes(j.status) && j.nextAt <= this.now());
-      if (!job) return;
+      claimed = this.claimWork();
+      if (!claimed) return;
+      const { job, lease } = claimed;
+      const controller = new AbortController();
+      let lost = false;
+      heartbeat = setInterval(() => {
+        try { if (this.store.renewLease(lease, this.now(), this.leaseMs)) return; } catch { /* Lost storage access means no authority to deliver. */ }
+        lost = true; controller.abort();
+      }, Math.floor(this.leaseMs / 3));
+      heartbeat.unref();
       const adapter = this.registry.resolve(job);
       // Guard against configuration drift: the adapter that runs a job must agree
       // with the job's recorded isMock, so a real job is never served by the mock.
-      if (!adapter || adapter.isMock !== job.isMock) {
-        this.transition(job, 'awaiting_manual', '执行器配置与任务标识不一致，已暂停', 'ADAPTER_MISMATCH'); return;
-      }
       let outcome;
-      try { outcome = await adapter.advance(job, { pdf: this.pdf }); }
+      const snapshot = JSON.stringify(job);
+      try {
+        outcome = !adapter || adapter.isMock !== job.isMock
+          ? { kind: 'transition', status: 'awaiting_manual', text: '执行器配置与任务标识不一致，已暂停', error: 'ADAPTER_MISMATCH' }
+          : await adapter.advance(structuredClone(job), { pdf: this.pdf, signal: controller.signal });
+      }
       catch { outcome = { kind: 'transition', status: 'awaiting_manual', text: '执行服务异常，结果未知，转人工核实', error: 'RESULT_UNKNOWN' }; }
-      this.applyOutcome(job, outcome);
-    } finally { this.busy = false; }
+      this.store.transaction(() => {
+        const current = this.store.lease(job.id);
+        if (lost || !current || current.token !== lease.token || current.owner !== lease.owner || current.expires <= this.now()) return;
+        if (JSON.stringify(this.store.get('job', job.id)) !== snapshot) return;
+        this.applyOutcome(job, outcome);
+        // These contract rejections explicitly mean the request cannot execute.
+        // Unknown, interrupted or candidate results retain the account hold.
+        if (!job.isMock && job.status === 'failed' && ['PARAM_INVALID', 'PRODUCT_UNAVAILABLE'].includes(job.error)) {
+          const removed = this.store.db.prepare('DELETE FROM execution_resources WHERE job_id=?').run(job.id).changes;
+          if (removed) this.eventForJob(job, 'execution.account-released', '执行服务明确拒绝参数或产品，释放账号；修改后须重新确认');
+        }
+      });
+    } finally {
+      clearInterval(heartbeat);
+      try { if (claimed) this.store.releaseLease(claimed.lease); }
+      finally { this.busy = false; }
+    }
   }
   applyOutcome(job, outcome) {
     if (!outcome) return;
+    const allowed = { queued: ['running', 'awaiting_manual', 'failed'], running: ['validating', 'awaiting_manual', 'failed'], validating: ['awaiting_manual', 'failed'] };
+    check(Object.hasOwn(allowed, job.status), 409, 'STATE_CONFLICT', '已结束的任务不能接受执行结果。');
+    if (job.status === 'queued' && job.productId === product.id && this.productAvailability(job, job.productId).paused) {
+      return this.transition(job, 'awaiting_manual', '产品已暂停，排队任务停止执行，等待运营核实', 'PRODUCT_PAUSED');
+    }
+    if (outcome.kind === 'transition' && outcome.error === 'PORTAL_CHANGED' && job.productId === product.id) {
+      const actor = { id: job.ownerId, tenantId: job.tenantId, name: '计划书执行服务', role: 'operator' };
+      const current = this.productAvailability(actor, job.productId);
+      if (!current.paused) this.setProductAvailability(actor, job.productId, { paused: true, revision: current.revision, reason: '执行器检测到门户变化，暂停新任务，需运营核实后恢复' });
+    }
+    const reject = () => this.transition(job, 'awaiting_manual', '执行结果不符合当前交付契约，已阻止交付', 'RESULT_UNKNOWN');
     if (outcome.kind === 'artifact') {
+      // Only the demonstration verifier exists today. Real artifacts require a
+      // separate deterministic verifier in M1b; an adapter cannot self-approve.
+      if (!job.isMock || job.status !== 'validating' || !Buffer.isBuffer(outcome.bytes) ||
+          outcome.bytes.subarray(0, 5).toString() !== '%PDF-') return reject();
+      const next = structuredClone(job);
       this.store.transaction(() => {
-        this.store.artifact(job.id, outcome.bytes); job.artifactHash = createHash('sha256').update(outcome.bytes).digest('hex');
-        this.transition(job, 'succeeded', outcome.text);
+        this.store.artifact(job.id, outcome.bytes); next.artifactHash = createHash('sha256').update(outcome.bytes).digest('hex');
+        this.persistTransition(next, 'succeeded', outcome.text);
       });
+      Object.assign(job, next);
       return;
     }
-    if (outcome.patch) Object.assign(job, outcome.patch);
-    this.transition(job, outcome.status, outcome.text, outcome.error ?? null);
+    if (outcome.kind !== 'transition' || !allowed[job.status].includes(outcome.status) ||
+        (outcome.patch && (typeof outcome.patch !== 'object' || Array.isArray(outcome.patch) ||
+          Object.keys(outcome.patch).some(key => !['source', 'validation', 'artifactRef'].includes(key))))) return reject();
+    this.transition(job, outcome.status, outcome.text, outcome.error ?? null, outcome.patch);
   }
   readPdf(actor, jobId) {
     const job = this.get(actor, 'job', jobId);
     check(job.status === 'succeeded', 409, 'NOT_READY', '文件尚未通过核对。');
-    const bytes = this.store.readArtifact(jobId); check(bytes, 404, 'FILE_MISSING', '文件尚不可用。'); return bytes;
+    const bytes = this.store.readArtifact(jobId); check(bytes, 404, 'FILE_MISSING', '文件尚不可用。');
+    check(bytes.subarray(0, 5).toString() === '%PDF-' && createHash('sha256').update(bytes).digest('hex') === job.artifactHash,
+      409, 'FILE_INTEGRITY', '文件完整性核对失败，请联系运营核实。');
+    return bytes;
   }
   package(actor, jobId) {
     const job = this.get(actor, 'job', jobId);
@@ -182,7 +319,7 @@ export class Service {
       this.store.put('package', pack);
     }
     const latest = Math.max(...this.store.list('job', { id: job.ownerId, tenantId: job.tenantId }).filter(j => j.clientId === job.clientId).map(j => j.version));
-    return { ...pack, outdated: job.version < latest, job, facts: product.fields.map(field => ({ key: field.key, label: field.label,
+    return { ...pack, outdated: job.version < latest, job, facts: (job.productSnapshot?.fields ?? product.fields).map(field => ({ key: field.key, label: field.label,
       value: field.key === 'smoker' ? job.params.smoker ? '吸烟' : '不吸烟' : String(job.params[field.key]), source: '模拟参数确认单 · 第 1 页', page: 1 })),
       sections: [
         { title: '方案概况', text: `本方案为演示储蓄计划 V${job.version}，用于说明从参数确认到生成文件的工作流程。` },
@@ -219,16 +356,29 @@ export class Service {
   }
   resolve(actor, jobId, input) {
     check(actor.role === 'operator', 403, 'ROLE_REQUIRED', '只有运营身份可以处理人工队列。');
-    const job = this.get(actor, 'job', jobId);
-    check(job.status === 'awaiting_manual', 409, 'STATE_CONFLICT', '该任务当前不在人工队列。');
-    check(['retry_mock', 'close'].includes(input.action), 422, 'ACTION_INVALID', '请选择有效操作。');
-    check(string(input.note).length >= 2, 422, 'NOTE_REQUIRED', '请填写处理说明。');
-    if (input.action === 'retry_mock') {
-      check(job.isMock, 409, 'MOCK_ONLY', '该操作只适用于模拟任务。');
-      check(job.error !== 'PDF_MISMATCH', 409, 'MISMATCH_BLOCKED', '文件错配任务不能直接重试，请关闭并重新确认参数。');
-      job.scenario = 'success'; this.transition(job, 'queued', '运营已处理模拟登录问题，重新排队');
-    } else this.transition(job, 'failed', '运营已关闭任务，请经纪重新核对后新建');
-    this.audit(actor, 'operator.resolved', job.id, string(input.note), job.clientId); return job;
+    return this.store.transaction(() => {
+      const job = this.get(actor, 'job', jobId);
+      check(job.status === 'awaiting_manual', 409, 'STATE_CONFLICT', '该任务当前不在人工队列。');
+      check(['retry_mock', 'close'].includes(input.action), 422, 'ACTION_INVALID', '请选择有效操作。');
+      check(string(input.note).length >= 2, 422, 'NOTE_REQUIRED', '请填写处理说明。');
+      const resource = this.store.db.prepare('SELECT resource_key FROM execution_resources WHERE job_id=?').get(job.id);
+      if (resource) {
+        check(input.action === 'close' && input.portalChecked === true, 409, 'PORTAL_CHECK_REQUIRED', '请先人工核实门户操作已结束并确认结果，再关闭任务释放账号。');
+        const lease = this.store.lease(job.id);
+        check(!lease || lease.expires <= this.now(), 409, 'EXECUTION_ACTIVE', '本地执行仍持有有效租约，请等待执行结束。');
+      }
+      if (input.action === 'retry_mock') {
+        this.assertProductAvailable(actor, job.productId);
+        check(job.isMock, 409, 'MOCK_ONLY', '该操作只适用于模拟任务。');
+        check(job.error !== 'PDF_MISMATCH', 409, 'MISMATCH_BLOCKED', '文件错配任务不能直接重试，请关闭并重新确认参数。');
+        job.scenario = 'success'; this.transition(job, 'queued', '运营已处理模拟登录问题，重新排队');
+      } else this.transition(job, 'failed', '运营已关闭任务，请经纪重新核对后新建');
+      if (resource) {
+        this.store.db.prepare('DELETE FROM execution_resources WHERE resource_key=? AND job_id=?').run(resource.resource_key, job.id);
+        this.audit(actor, 'execution.account-released', job.id, '运营确认门户操作已结束并核实结果，释放执行账号', job.clientId);
+      }
+      this.audit(actor, 'operator.resolved', job.id, string(input.note), job.clientId); return job;
+    });
   }
   checkAssistantInput(text) {
     check(!evaluateCompliance({ text }).rules.includes(COMPLIANCE_RULES.SENSITIVE), 422, 'SENSITIVE_INPUT', '请移除凭据或敏感标识，仅通过受控凭据引用配置。');
