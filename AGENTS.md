@@ -37,19 +37,26 @@
 - **完整产品确认快照**：draft／job 保存 `productSnapshot`+hash，产品版本、字段约束、保司或执行方式漂移需重新确认。
 - **离线参数抽取加固**：`server/dify/parameter-extractor.mjs`，冲突留空、不推断性别；`/api/extract` 校验
   `schemaVersion`（旧版 409）；下载复核文件 hash（`FILE_INTEGRITY`）。
-- 验收：Node 24 下 149 项测试通过，`npm run test:smoke` 实际 Python 模拟 PDF 全流程通过。
+- **M1b 交付核验闸门（离线预备）**：`validating` 时 adapter 只能经注入的 `fetchArtifact` 取回候选文件，
+  由业务服务 `server/verify/pdf-verifier.mjs` 按确认快照逐字段＋版本核验，通过才 `succeeded` 并释放账号；
+  不一致 `PDF_MISMATCH`、无法核验 `RESULT_UNKNOWN`，均转人工且保留占用。证据不存 PDF 读出的值。
+  样本包接收检查：`scripts/check-samples.mjs`。
+- **Dify 离线加固（2026-09-23）**：出口／输入合规守卫识别香港身份证号（校验位确定性核对，规则版本 `m2a2-3`）；
+  `DifyClient` 按应用分别配置 key（chat／extract／compliance），不共用、不顶替，缺哪个只那项报未配置；
+  参数抽取不把"收益／回报"旁的金额当保费；RL 红线用例写成离线回归（`tests/dify-redline.test.mjs`）。
+- 验收：Node 24 下 199 项测试通过，`npm run test:smoke` 实际 Python 模拟 PDF 全流程通过。
   详见 [接续与验收记录](docs/progress-2026-09-22.md)。
 
 **仍是 mock / 未接入**
 - 计划书执行：仅 `MockInsurerAdapter`（本地生成显著标注的模拟 PDF）。`PythonInsurerAdapter`
   是骨架，**未连接任何真实香港端点，未声称支持任何真实保司**。
-- 真实文件交付链路（M1b 待补）：真实任务不能从 `validating` 进入 `succeeded`，候选文件一律转人工；
-  确定性官方 PDF 核验器未实现（`PDF_MISMATCH` 目前只由 mock 产生）；核验通过后释放账号占用尚无逻辑。
+- 真实文件交付（M1b 待补）：**没有任何真实产品的核验规则**（须按签认样本 `checklist.md` 编写），所以真实候选文件
+  仍一律转人工；香港侧文件取回 `fetchArtifact` 无默认实现；真实任务讲解包未接入（`PACKAGE_NOT_READY`）。
 - 参数抽取 `extract()` / 知识问答 `assistant()`：经 `DifyClient` 抽象，但当前走 `LocalFallbackDifyClient`
   本地有限规则，**非** LLM，诚实标注"未调用 Dify"。`HttpDifyClient` 是骨架，未接真实 Dify 实例。
 - 香港 Python、真实保司门户、真实 Dify 实例、知识库、APP IM：未接入。`/api/bootstrap` 诚实返回
-  `python: awaiting-hong-kong / configured`、`dify: not-configured / configured`、`im: prototype-only`。
-- M2a-2 应用入口拒绝真实 Dify 环境配置，正常运行只返回 `dify: not-configured`；
+  `python: awaiting-hong-kong / configured`、`dify: not-configured / partially-configured / configured`、`im: prototype-only`。
+- M2a-2 应用入口拒绝任一预留 Dify 环境变量（`DIFY_ENV_VARS`），正常运行只返回 `dify: not-configured`；
   `HttpDifyClient` 仅保留注入离线 transport 的契约测试。进度工具只返回 `not-configured`、
   空来源／空进度；真实保单／理赔查询**未完成**。回调仅更新独立 `dify-run`，不驱动 M1 执行器。
 
@@ -87,9 +94,11 @@
   - **M2a-1**（DifyClient 抽象、诚实降级、确定性出口合规守卫、`assistant` 出口审查）— ✅ **已完成**。
   - **M2a-2**（Dify 工具接口：`compliance-audit` 保存、`callback` 签名校验+去重、`progress` 骨架；
     鉴权网关：短期令牌、后端校验身份/数据范围、`user`/`conversation_id` 后端维护映射）— ✅ **离线部分已完成**。
-    工作台已接合规判定／参数卡／出处；35 项离线测试通过。真实进度与真实 Dify 部署仍未完成。
+    工作台已接合规判定／参数卡／出处；M2a-2 验收时 35 项离线测试通过。真实进度与真实 Dify 部署仍未完成。
   - **M2b**（真实香港 Dify 实例 + DeepSeek + 三工作流 DSL 部署 + API key）— ⏳ **待环境，未开始**。
-    注意：`DifyClient` 目前只有一个 `apiKey`，Dify 每个应用独立 key，三个工作流需后端分别配置。
+    已离线备好按应用分 key 的 `HttpDifyClient`（`apiKeys`）和 `reviewCompliance`（仅可收紧判定）。
+    接入前 `service.mjs` 还需：`extract()` 传后端 `user`；非本地引擎如实标注；Dify 调用失败记审计；
+    `reviewCompliance` 接入 `assistant` 出口；`index.mjs` 按 `apiKeys` 配线。
     环境请求单、隐私审批问题、验收规划见 [docs/handoff/m2b-m3/](docs/handoff/m2b-m3/request-dify.md)。
 - **M3 · 知识库**（产品条款、操作流程、合规红线、门户手册；带来源、版本、失效日期）— 未开始。
   知识问答分支依赖知识库，在 M3 验收；资料接收规范见 [kb-intake](docs/handoff/m2b-m3/kb-intake.md)。
@@ -123,6 +132,7 @@
   - `mock-adapter.mjs`（`MockInsurerAdapter`，演示 PDF）
   - `python-adapter.mjs`（`PythonInsurerAdapter` 骨架：截止时间、禁止重定向、任务／尝试绑定、响应白名单）
   - `registry.mjs`（**唯一的 mock/real 判定点**，无静默回退）
+- `server/verify/pdf-verifier.mjs` — 真实候选文件的确定性核验（结构检查＋按产品版本注册的定位规则，业务服务调用）。
 - `server/dify/` — Dify 集成：
   - `dify-client.mjs`（`DifyClient` 接口、`HttpDifyClient` 骨架、`createDifyClient` 工厂，key 只在后端）
   - `local-fallback.mjs`（`LocalFallbackDifyClient`，未配置时的本地降级引擎）
@@ -134,6 +144,8 @@
 - `tests/dify-tools.test.mjs` / `tests/assistant-view.test.mjs` — 离线 HTTP 安全矩阵、重启／并发／回滚、前端渲染。
 - `tests/worker-lease.test.mjs`（含 `tests/helpers/lease-worker.mjs` 子进程）/ `execution-resource` /
   `product-control` / `extraction` — 租约、账号占用、产品暂停、参数抽取语料。 `scripts/smoke.mjs` — 实际 Python 全流程冒烟。
+- `tests/pdf-verifier.test.mjs` / `real-delivery` / `sample-check` — 核验器、真实交付闸门、样本包接收检查
+  （全部为测试夹具）。 `scripts/check-samples.mjs` — M1b 样本包接收检查。
 - `server/catalog.mjs` — 演示产品/角色/知识/状态标签。
 - `server/store.mjs` — SQLite 持久化。 `server/pdf.mjs` + `scripts/demo_pdf.py` — 模拟 PDF。
 - `server/errors.mjs` — `AppError` / `check`。 `public/` — 前端。 `tests/` — service/http/adapter 测试。
