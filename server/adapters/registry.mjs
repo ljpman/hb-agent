@@ -10,9 +10,9 @@ import { PythonInsurerAdapter } from './python-adapter.mjs';
 // A product declares how it runs via `product.execution.mode`:
 //   { mode: 'mock' }                      → MockInsurerAdapter  (isMock: true)
 //   { mode: 'python', insurerId, ... }    → PythonInsurerAdapter (isMock: false)
-export function createAdapterRegistry({ pythonAdapterUrl = null, strict = false, transport } = {}) {
+export function createAdapterRegistry({ pythonAdapterUrl = null, strict = false, transport, fetchArtifact } = {}) {
   const mock = new MockInsurerAdapter();
-  const python = new PythonInsurerAdapter({ endpoint: pythonAdapterUrl, ...(transport ? { transport } : {}) });
+  const python = new PythonInsurerAdapter({ endpoint: pythonAdapterUrl, ...(transport ? { transport } : {}), ...(fetchArtifact ? { fetchArtifact } : {}) });
   const configured = Boolean(pythonAdapterUrl);
 
   function describe(product) {

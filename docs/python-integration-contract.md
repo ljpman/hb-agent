@@ -108,9 +108,20 @@ SQLite `job_leases` 按 job 保存 worker、随机 token、到期时间和心跳
 
 占用不会随 job 租约到期自动解除。候选文件尚未核验、网络超时、写库失败或进程重启时，先保留账号，防止远端仍运行时另一个任务进入。运营须在人工队列核实门户操作结束及结果，明确提交 `portalChecked: true` 后关闭任务；有效本地租约尚在时拒绝释放。关闭状态、账号释放与审计原子保存。契约明确返回 `PARAM_INVALID` / `PRODUCT_UNAVAILABLE` 的已匹配请求作为不可执行的拒绝，任务失败并释放占用；未知错误仍保留。
 
+核验通过、任务 `succeeded` 时也释放占用（门户操作已完成）；核验不一致或无法核验时保留，等待运营核实。
+
 香港接入前必须确认同一真实账号只映射一个稳定引用，并验证这两类错误确实表示执行前拒绝。不同引用若实际指向同一账号，本地无法自行识别。隔离仅覆盖共用此数据库的服务实例，不代替远端跨部署锁、门户会话隔离或官方授权范围。
 
 对应验证：`node --test tests/adapter.test.mjs`，包含任务／产品错配、恶意文件引用、远端附加字段、超时后队列恢复及 HTTP 重定向。真实 PDF 解析、官方来源证明和交付验收仍未完成。
+
+### 候选文件取回与本地核验（预备实现，2026-09-23）
+
+- `validating` 阶段 adapter 只按已保存的 `artifactRef`，经注入的受控 `fetchArtifact({ jobId, attemptId, artifactRef })` 取回文件字节，以 `candidate` 交回业务服务；同样受截止时间和租约取消约束。adapter 不能自行批准：真实任务返回 `artifact` 或自带核验结果一律转人工。香港侧文件如何提供尚未确认，因此没有默认取回实现，未配置时转人工。
+- 业务服务用 `server/verify/pdf-verifier.mjs` 核验：先按内容检查文件结构（非空、大小上限、`%PDF-` 文件头、未截断、未加密；HTML 登录页、图片、压缩包在此失败），再按 `productId@productVersion` 查找产品规则。规则只负责在 PDF 中**定位**值和页码；归一化与比对由核验器按确认快照的字段类型完成，规则不能决定"期望值"。
+- 确认快照的每个字段及产品版本都必须定位到页码并一致才 `passed`：保存文件和 sha256，任务 `succeeded`，释放账号占用。值不同或结构不合格 → `PDF_MISMATCH`；缺规则、缺字段／页码、无法解析、规则异常 → `RESULT_UNKNOWN`；两者都转人工、不保存文件、保留账号占用。
+- 核验证据只记字段、页码和是否一致，**不保存从 PDF 读出的值**。真实任务的讲解包模板仍为演示内容，暂不生成（`PACKAGE_NOT_READY`）。
+- 当前**没有任何真实产品规则**：规则须按签认的样本 `checklist.md` 编写。样本包先用 `node scripts/check-samples.mjs <目录>` 做接收检查（结构、元数据、hash、PDF 结构），它不比对 PDF 内容。
+- 对应验证：`tests/pdf-verifier.test.mjs`、`tests/real-delivery.test.mjs`、`tests/sample-check.test.mjs`，全部使用测试夹具，不代表任何真实保司或产品已支持。
 
 ## 5. 建议错误分类
 

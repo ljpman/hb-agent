@@ -7,6 +7,7 @@ import { createDifyClient } from './dify/dify-client.mjs';
 import { DifyGateway, saveCompliance } from './dify/gateway.mjs';
 import { LocalFallbackDifyClient } from './dify/local-fallback.mjs';
 import { evaluateCompliance, COMPLIANCE_RULES } from './dify/compliance.mjs';
+import { createPdfVerifier, VERIFY } from './verify/pdf-verifier.mjs';
 
 const id = prefix => `${prefix}-${randomUUID()}`;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -19,9 +20,9 @@ const scope = (actor, record) => record && record.tenantId === actor.tenantId &&
 // without a mapped reference share a conservative global execution slot.
 const executionResource = job => hash({ credentialRef: job.credentialRef || 'unconfigured-python-account' });
 export class Service {
-  constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500, registry = createAdapterRegistry(), dify = createDifyClient(), leaseMs = 30000 } = {}) {
+  constructor(store, { now = Date.now, pdf = createMockPdf, stepMs = 1500, registry = createAdapterRegistry(), dify = createDifyClient(), leaseMs = 30000, verifier = createPdfVerifier() } = {}) {
     check(Number.isSafeInteger(leaseMs) && leaseMs >= 30 && leaseMs <= 3600000, 500, 'LEASE_CONFIG_INVALID', '任务租约时长配置无效。');
-    this.workerId = id('worker'); this.leaseMs = leaseMs;
+    this.workerId = id('worker'); this.leaseMs = leaseMs; this.verifier = verifier;
     this.store = store; this.now = now; this.pdf = pdf; this.stepMs = stepMs; this.registry = registry; this.dify = dify; this.busy = false;
     this.seed(); this.recover(); this.difyGateway = new DifyGateway(this);
   }
@@ -251,16 +252,26 @@ export class Service {
           : await adapter.advance(structuredClone(job), { pdf: this.pdf, signal: controller.signal });
       }
       catch { outcome = { kind: 'transition', status: 'awaiting_manual', text: '执行服务异常，结果未知，转人工核实', error: 'RESULT_UNKNOWN' }; }
+      // The Service, not the adapter, verifies a real candidate against the
+      // confirmed snapshot. A verifier failure is unknown, never a pass.
+      let verification = null;
+      if (outcome?.kind === 'candidate' && !job.isMock && job.status === 'validating') {
+        try { verification = await this.verifier.verify({ bytes: outcome.bytes, job: structuredClone(job) }); }
+        catch { verification = null; }
+      }
       this.store.transaction(() => {
         const current = this.store.lease(job.id);
         if (lost || !current || current.token !== lease.token || current.owner !== lease.owner || current.expires <= this.now()) return;
         if (JSON.stringify(this.store.get('job', job.id)) !== snapshot) return;
-        this.applyOutcome(job, outcome);
-        // These contract rejections explicitly mean the request cannot execute.
-        // Unknown, interrupted or candidate results retain the account hold.
-        if (!job.isMock && job.status === 'failed' && ['PARAM_INVALID', 'PRODUCT_UNAVAILABLE'].includes(job.error)) {
-          const removed = this.store.db.prepare('DELETE FROM execution_resources WHERE job_id=?').run(job.id).changes;
-          if (removed) this.eventForJob(job, 'execution.account-released', '执行服务明确拒绝参数或产品，释放账号；修改后须重新确认');
+        this.applyOutcome(job, outcome, verification);
+        // Contract rejections mean the request never executed; a verified file
+        // means the portal work finished. Unknown, interrupted, unverifiable or
+        // mismatched results retain the account hold until an operator checks.
+        const release = job.isMock ? null
+          : job.status === 'failed' && ['PARAM_INVALID', 'PRODUCT_UNAVAILABLE'].includes(job.error) ? '执行服务明确拒绝参数或产品，释放账号；修改后须重新确认'
+          : job.status === 'succeeded' ? '文件已通过确定性核验，门户操作完成，释放账号' : null;
+        if (release && this.store.db.prepare('DELETE FROM execution_resources WHERE job_id=?').run(job.id).changes) {
+          this.eventForJob(job, 'execution.account-released', release);
         }
       });
     } finally {
@@ -269,7 +280,7 @@ export class Service {
       finally { this.busy = false; }
     }
   }
-  applyOutcome(job, outcome) {
+  applyOutcome(job, outcome, verification = null) {
     if (!outcome) return;
     const allowed = { queued: ['running', 'awaiting_manual', 'failed'], running: ['validating', 'awaiting_manual', 'failed'], validating: ['awaiting_manual', 'failed'] };
     check(Object.hasOwn(allowed, job.status), 409, 'STATE_CONFLICT', '已结束的任务不能接受执行结果。');
@@ -282,9 +293,10 @@ export class Service {
       if (!current.paused) this.setProductAvailability(actor, job.productId, { paused: true, revision: current.revision, reason: '执行器检测到门户变化，暂停新任务，需运营核实后恢复' });
     }
     const reject = () => this.transition(job, 'awaiting_manual', '执行结果不符合当前交付契约，已阻止交付', 'RESULT_UNKNOWN');
+    if (outcome.kind === 'candidate') return this.applyVerifiedCandidate(job, outcome, verification, reject);
     if (outcome.kind === 'artifact') {
-      // Only the demonstration verifier exists today. Real artifacts require a
-      // separate deterministic verifier in M1b; an adapter cannot self-approve.
+      // Demonstration path only. Real files arrive as `candidate` and pass the
+      // Service's deterministic verifier; an adapter cannot self-approve.
       if (!job.isMock || job.status !== 'validating' || !Buffer.isBuffer(outcome.bytes) ||
           outcome.bytes.subarray(0, 5).toString() !== '%PDF-') return reject();
       const next = structuredClone(job);
@@ -300,6 +312,27 @@ export class Service {
           Object.keys(outcome.patch).some(key => !['source', 'validation', 'artifactRef'].includes(key))))) return reject();
     this.transition(job, outcome.status, outcome.text, outcome.error ?? null, outcome.patch);
   }
+  applyVerifiedCandidate(job, outcome, verification, reject) {
+    const bytes = outcome.bytes;
+    if (job.isMock || job.status !== 'validating' || !Buffer.isBuffer(bytes) || !job.artifactRef || outcome.artifactRef !== job.artifactRef ||
+        !verification || !Object.values(VERIFY).includes(verification.status)) return reject();
+    const fileSha256 = createHash('sha256').update(bytes).digest('hex');
+    if (verification.fileSha256 !== fileSha256) return reject();
+    // Evidence names each checked field and page; values read from the PDF are
+    // never stored, so no unverified document number reaches brokers or chat.
+    const validation = { status: verification.status, ruleSet: verification.ruleSet ?? null, problem: verification.problem ?? null, fileSha256, checkedAt: iso(this.now()),
+      checks: (verification.checks ?? []).map(({ field, page, match }) => ({ field: String(field), page, match: match === true })) };
+    if (verification.status === VERIFY.mismatch) return this.transition(job, 'awaiting_manual', '文件核验失败，已阻止交付', 'PDF_MISMATCH', { validation });
+    if (verification.status !== VERIFY.passed || !validation.checks.length || !validation.checks.every(item => item.match)) {
+      return this.transition(job, 'awaiting_manual', '无法可靠核验候选文件，转人工核对', 'RESULT_UNKNOWN', { validation });
+    }
+    const next = { ...structuredClone(job), validation, artifactHash: fileSha256 };
+    this.store.transaction(() => {
+      this.store.artifact(job.id, bytes);
+      this.persistTransition(next, 'succeeded', '文件已通过确定性核验，可下载');
+    });
+    Object.assign(job, next);
+  }
   readPdf(actor, jobId) {
     const job = this.get(actor, 'job', jobId);
     check(job.status === 'succeeded', 409, 'NOT_READY', '文件尚未通过核对。');
@@ -311,6 +344,9 @@ export class Service {
   package(actor, jobId) {
     const job = this.get(actor, 'job', jobId);
     check(job.status === 'succeeded', 409, 'NOT_READY', '计划书完成后才能查看讲解包。');
+    // The package template is demonstration content; real explanation packs need
+    // verified official facts first, so they are not generated for real files.
+    check(job.isMock, 409, 'PACKAGE_NOT_READY', '真实计划书的讲解包尚未接入，请先查看已核验的官方文件。');
     let pack = this.store.get('package', jobId);
     if (!pack) {
       pack = { id: jobId, tenantId: job.tenantId, ownerId: job.ownerId, clientId: job.clientId, revision: 1, status: 'draft', isMock: true,

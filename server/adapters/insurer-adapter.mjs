@@ -18,12 +18,17 @@
 // Outcome is a plain, serializable description the Service applies; adapters do
 // not mutate the store directly:
 //   { kind: 'transition', status, text, error?, patch? }
-//   { kind: 'artifact', bytes, text }     — store the verified artifact, succeed
+//   { kind: 'artifact', bytes, text }     — demonstration only: mock jobs may succeed
+//   { kind: 'candidate', artifactRef, bytes, text }
+//                                         — real jobs: bytes fetched for the stored
+//                                           artifactRef; the Service verifies them
 //
 // `patch` only permits source, validation and artifactRef metadata. Identity,
 // confirmation and execution fields cannot be replaced by adapter results.
 // The Service validates transitions and commits status, audit and file together.
-// Real artifact delivery stays disabled until M1b's deterministic verifier exists.
+// A real job succeeds only when the Service's deterministic verifier
+// (server/verify/pdf-verifier.mjs) passes the candidate against the confirmed
+// snapshot. No product rules exist yet, so real candidates still go to manual.
 
 // Status vocabulary shared across adapters and the Service state machine.
 export const STATUS = Object.freeze({

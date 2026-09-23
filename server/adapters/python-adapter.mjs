@@ -10,10 +10,11 @@ import { STATUS, ERROR } from './insurer-adapter.mjs';
 // Deliberate M1a limits, per the project red lines:
 //   * Without a configured endpoint it routes to manual (ADAPTER_NOT_CONFIGURED),
 //     never falling back to the mock.
-//   * A candidate file is only ever parked in `validating`. Deterministic PDF
-//     verification against the confirmed snapshot needs real fields and sample
-//     PDFs, which arrive in M1b — so this skeleton never auto-delivers a real
-//     file (validating → manual with RESULT_UNKNOWN).
+//   * A candidate file is only ever parked in `validating`. In validating the
+//     adapter can only FETCH the bytes for the stored artifactRef (through an
+//     injected, controlled `fetchArtifact`) and hand them back as a `candidate`.
+//     The business Service runs the deterministic verifier; the adapter never
+//     approves its own file. Without `fetchArtifact` the job goes to manual.
 //   * Parameter errors are not retried; anything uncertain or portal-side goes
 //     to manual. Transient errors are held for manual review rather than
 //     blind-retried, because re-running a real portal task risks a duplicate.
@@ -49,13 +50,19 @@ async function fetchTransport(endpoint, request, { signal } = {}) {
   return response.json();
 }
 
+const reference = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/.test(value);
+
 export class PythonInsurerAdapter {
   isMock = false;
 
-  constructor({ endpoint = null, transport = fetchTransport, contractVersion = '1', timeoutMs = 120000 } = {}) {
+  // fetchArtifact({ jobId, attemptId, artifactRef }, { signal }) → Buffer. How the
+  // Hong Kong service serves files is not confirmed yet, so there is no default.
+  constructor({ endpoint = null, transport = fetchTransport, fetchArtifact = null, contractVersion = '1', timeoutMs = 120000 } = {}) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) throw new TypeError('timeoutMs must be a positive bounded integer');
+    if (fetchArtifact !== null && typeof fetchArtifact !== 'function') throw new TypeError('fetchArtifact must be a function');
     this.endpoint = endpoint;
     this.transport = transport;
+    this.fetchArtifact = fetchArtifact;
     this.contractVersion = contractVersion;
     this.timeoutMs = timeoutMs;
   }
@@ -79,6 +86,29 @@ export class PythonInsurerAdapter {
     };
   }
 
+  // Bound even injected calls that ignore AbortSignal. An aborted local call does
+  // not prove the remote side stopped, so callers treat any failure as unknown.
+  async bounded(call, signal) {
+    const controller = new AbortController();
+    let timer, cancel;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => call(controller.signal)),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error('Execution deadline exceeded')); }, this.timeoutMs);
+        }),
+        new Promise((_, reject) => {
+          cancel = () => { controller.abort(); reject(new Error('Execution lease lost')); };
+          if (signal?.aborted) cancel();
+          else signal?.addEventListener('abort', cancel, { once: true });
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      if (cancel) signal?.removeEventListener('abort', cancel);
+    }
+  }
+
   async advance(job, { signal } = {}) {
     if (!this.endpoint) {
       return { kind: 'transition', status: STATUS.awaiting_manual, text: '真实执行服务尚未配置', error: ERROR.ADAPTER_NOT_CONFIGURED };
@@ -89,28 +119,12 @@ export class PythonInsurerAdapter {
     if (job.status === STATUS.running) {
       let result;
       const request = this.buildRequest(job);
-      const controller = new AbortController();
-      let timer, cancel;
       try {
-        // Bound even injected transports that ignore AbortSignal. An uncertain
-        // submission is never retried automatically, including a late response.
-        result = await Promise.race([
-          Promise.resolve().then(() => this.transport(this.endpoint, request, { signal: controller.signal })),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => { controller.abort(); reject(new Error('Execution deadline exceeded')); }, this.timeoutMs);
-          }),
-          new Promise((_, reject) => {
-            cancel = () => { controller.abort(); reject(new Error('Execution lease lost')); };
-            if (signal?.aborted) cancel();
-            else signal?.addEventListener('abort', cancel, { once: true });
-          }),
-        ]);
+        // An uncertain submission is never retried automatically, including a late response.
+        result = await this.bounded(abort => this.transport(this.endpoint, request, { signal: abort }), signal);
       } catch {
         // Uncertain result: do not blindly retry a real portal task.
         return { kind: 'transition', status: STATUS.awaiting_manual, text: '调用执行服务失败，结果未知，转人工核实', error: ERROR.RESULT_UNKNOWN };
-      } finally {
-        clearTimeout(timer);
-        if (cancel) signal?.removeEventListener('abort', cancel);
       }
       // A real service must never silently hand back a mock result.
       if (result && result.isMock === true) {
@@ -125,7 +139,6 @@ export class PythonInsurerAdapter {
         return { kind: 'transition', ...mapped };
       }
       const source = result.source;
-      const reference = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/.test(value);
       if (result.status !== STATUS.validating || !reference(result.artifactRef) || !source ||
           !reference(source.insurerId) || source.productId !== job.productId || source.productVersion !== job.productVersion ||
           (job.execution?.insurerId && source.insurerId !== job.execution.insurerId)) return unknown;
@@ -142,8 +155,19 @@ export class PythonInsurerAdapter {
         },
       };
     }
-    // validating: deterministic verification against the confirmed snapshot is
-    // deferred to M1b (needs real fields + sample PDFs). Never auto-succeed.
-    return { kind: 'transition', status: STATUS.awaiting_manual, text: '真实文件核验规则尚未接入，转人工核对', error: ERROR.RESULT_UNKNOWN };
+    // validating: fetch the candidate for the stored reference only. The Service
+    // verifies it against the confirmed snapshot; this adapter cannot succeed a job.
+    const unknown = { kind: 'transition', status: STATUS.awaiting_manual, text: '候选文件无法可靠取回，转人工核实', error: ERROR.RESULT_UNKNOWN };
+    if (!this.fetchArtifact) {
+      return { kind: 'transition', status: STATUS.awaiting_manual, text: '真实文件取回与核验尚未接入，转人工核对', error: ERROR.RESULT_UNKNOWN };
+    }
+    if (!reference(job.artifactRef) || !job.executionAttempt?.id) return unknown;
+    let bytes;
+    try {
+      bytes = await this.bounded(abort => this.fetchArtifact({ jobId: job.id, attemptId: job.executionAttempt.id, artifactRef: job.artifactRef }, { signal: abort }), signal);
+    } catch { return unknown; }
+    if (bytes instanceof Uint8Array && !Buffer.isBuffer(bytes)) bytes = Buffer.from(bytes);
+    if (!Buffer.isBuffer(bytes)) return unknown;
+    return { kind: 'candidate', artifactRef: job.artifactRef, bytes, text: '已取回候选文件，等待业务服务核验' };
   }
 }
