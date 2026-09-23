@@ -26,10 +26,25 @@
   经纪与资源范围校验、后端会话映射；合规判定与 hash 持久保存／鉴权查询；异步回调事件去重、
   顺序／版本与终态保护；工作台展示合规结果、输入依据及待确认参数卡。详见
   [M2a-2 契约与自验收](docs/m2a2-offline-tools.md)。
+- **M1 本地加固（2026-09-22/23）**：`PythonInsurerAdapter` 请求截止、禁止重定向、任务／尝试／产品绑定、
+  响应字段白名单；adapter 不能覆盖身份／快照，非法状态跳转被拒，状态／文件与审计原子落库。
+- **多进程任务租约**：SQLite 租约 + 心跳续租，结果提交校验 token／快照；真实调用前落库尝试编号，
+  租约失效或结果未落库转人工，不自动重提。
+- **执行账号隔离**：`execution_resources` 按服务端 `credentialRef` 串行（跨租户同样）；结果不确定时保持占用，
+  运营核实门户结束后才释放。
+- **产品暂停／恢复**：运营按租户暂停（必填原因）、`PORTAL_CHANGED` 自动暂停，排队任务转人工，恢复不自动重跑。
+  见 [产品暂停与人工处理](docs/product-operations.md)。
+- **完整产品确认快照**：draft／job 保存 `productSnapshot`+hash，产品版本、字段约束、保司或执行方式漂移需重新确认。
+- **离线参数抽取加固**：`server/dify/parameter-extractor.mjs`，冲突留空、不推断性别；`/api/extract` 校验
+  `schemaVersion`（旧版 409）；下载复核文件 hash（`FILE_INTEGRITY`）。
+- 验收：Node 24 下 149 项测试通过，`npm run test:smoke` 实际 Python 模拟 PDF 全流程通过。
+  详见 [接续与验收记录](docs/progress-2026-09-22.md)。
 
 **仍是 mock / 未接入**
 - 计划书执行：仅 `MockInsurerAdapter`（本地生成显著标注的模拟 PDF）。`PythonInsurerAdapter`
   是骨架，**未连接任何真实香港端点，未声称支持任何真实保司**。
+- 真实文件交付链路（M1b 待补）：真实任务不能从 `validating` 进入 `succeeded`，候选文件一律转人工；
+  确定性官方 PDF 核验器未实现（`PDF_MISMATCH` 目前只由 mock 产生）；核验通过后释放账号占用尚无逻辑。
 - 参数抽取 `extract()` / 知识问答 `assistant()`：经 `DifyClient` 抽象，但当前走 `LocalFallbackDifyClient`
   本地有限规则，**非** LLM，诚实标注"未调用 Dify"。`HttpDifyClient` 是骨架，未接真实 Dify 实例。
 - 香港 Python、真实保司门户、真实 Dify 实例、知识库、APP IM：未接入。`/api/bootstrap` 诚实返回
@@ -67,13 +82,19 @@
   - **M1b**（接真实香港端点、1 社 1 产品实字段、样本核验、真实 PDF 核对）— ⏳ **待输入，未完成**。
     需要：1 社/1 产品/官方版本、入口函数与运行命令/依赖、真实字段与约束、PDF 获取方式、
     登录/MFA 方式、3–5 组"官方输入↔官方PDF"样本、`credentialRef`（不要明文密码）。
+    对外资料请求单、样本规范与验收用例已备：[docs/handoff/m1b/](docs/handoff/m1b/request-hk.md)。
 - **M2 · 接 Dify**（意图识别、知识问答、参数抽取、合规审查）
   - **M2a-1**（DifyClient 抽象、诚实降级、确定性出口合规守卫、`assistant` 出口审查）— ✅ **已完成**。
   - **M2a-2**（Dify 工具接口：`compliance-audit` 保存、`callback` 签名校验+去重、`progress` 骨架；
     鉴权网关：短期令牌、后端校验身份/数据范围、`user`/`conversation_id` 后端维护映射）— ✅ **离线部分已完成**。
     工作台已接合规判定／参数卡／出处；35 项离线测试通过。真实进度与真实 Dify 部署仍未完成。
   - **M2b**（真实香港 Dify 实例 + DeepSeek + 三工作流 DSL 部署 + API key）— ⏳ **待环境，未开始**。
+    注意：`DifyClient` 目前只有一个 `apiKey`，Dify 每个应用独立 key，三个工作流需后端分别配置。
+    环境请求单、隐私审批问题、验收规划见 [docs/handoff/m2b-m3/](docs/handoff/m2b-m3/request-dify.md)。
 - **M3 · 知识库**（产品条款、操作流程、合规红线、门户手册；带来源、版本、失效日期）— 未开始。
+  知识问答分支依赖知识库，在 M3 验收；资料接收规范见 [kb-intake](docs/handoff/m2b-m3/kb-intake.md)。
+- **上线验收**（APP 登录／IM、生产部署、监控备份、运营参数、经纪试点）— 未开始；
+  对接问题单与试点方案见 [docs/handoff/launch/](docs/handoff/launch/pilot-plan.md)。
 
 映射关系（供对照，不改变上面的执行顺序）：M1 对应 [交付计划](docs/delivery-plan-v1.md) 的
 封装服务与真实保司链路（步骤 2–3）；M2/M3 对应 [Dify 计划](docs/dify-workflow-plan.md) 的三个
@@ -83,7 +104,8 @@
 
 ## §4 工作纪律
 
-- 一次一个 milestone；每个改动**写测试**，且**不破坏现有测试**：`node --test tests/*.test.mjs`。
+- 一次一个 milestone；每个改动**写测试**，且**不破坏现有测试**：`npm test`（需 Node 24+；本机较低时用
+  `npm exec --yes --package=node@24 -- node --test tests/*.test.mjs`），涉及执行链路再跑 `npm run test:smoke`。
 - 真实与模拟边界清楚区分；`isMock` 保持诚实。缺输入时如实返回"未配置/待验证"，不伪称已调用。
 - 不把纯内存队列当可交付任务库；任务事实持久化（现为 SQLite）。
 - 动手前先与用户确认理解与计划（尤其涉及 §2 红线时）；不自作主张 commit / 开 PR / 对外发送。
@@ -99,15 +121,19 @@
 - `server/adapters/` — 执行器抽象：
   - `insurer-adapter.mjs`（接口契约 + 状态/错误码常量）
   - `mock-adapter.mjs`（`MockInsurerAdapter`，演示 PDF）
-  - `python-adapter.mjs`（`PythonInsurerAdapter` 骨架，说对接契约）
+  - `python-adapter.mjs`（`PythonInsurerAdapter` 骨架：截止时间、禁止重定向、任务／尝试绑定、响应白名单）
   - `registry.mjs`（**唯一的 mock/real 判定点**，无静默回退）
 - `server/dify/` — Dify 集成：
   - `dify-client.mjs`（`DifyClient` 接口、`HttpDifyClient` 骨架、`createDifyClient` 工厂，key 只在后端）
   - `local-fallback.mjs`（`LocalFallbackDifyClient`，未配置时的本地降级引擎）
+  - `parameter-extractor.mjs`（离线有限规则参数抽取：冲突留空、输入原文作依据）
   - `compliance.mjs`（`evaluateCompliance`，**发送前的确定性出口红线守卫**）
   - `gateway.mjs`（后端令牌签发、持久会话／nonce、合规审计、进度骨架、独立回调状态机）
 - `public/assistant-view.mjs` — 合规状态、审查详情、输入依据与待确认参数卡；block 隐藏动作。
+- `public/product-control.mjs` — 运营「产品与资料」暂停／恢复表单。
 - `tests/dify-tools.test.mjs` / `tests/assistant-view.test.mjs` — 离线 HTTP 安全矩阵、重启／并发／回滚、前端渲染。
+- `tests/worker-lease.test.mjs`（含 `tests/helpers/lease-worker.mjs` 子进程）/ `execution-resource` /
+  `product-control` / `extraction` — 租约、账号占用、产品暂停、参数抽取语料。 `scripts/smoke.mjs` — 实际 Python 全流程冒烟。
 - `server/catalog.mjs` — 演示产品/角色/知识/状态标签。
 - `server/store.mjs` — SQLite 持久化。 `server/pdf.mjs` + `scripts/demo_pdf.py` — 模拟 PDF。
 - `server/errors.mjs` — `AppError` / `check`。 `public/` — 前端。 `tests/` — service/http/adapter 测试。
@@ -126,4 +152,8 @@
 - [docs/dify-workflow-plan.md](docs/dify-workflow-plan.md) — Dify 三个工作流、接口、安全边界、验收样例（M2/M3 依据）。
 
 补充参考：[分阶段交付计划](docs/delivery-plan-v1.md)、[第一步启动包](docs/phase-01-start-pack.md)、
-[开发任务清单](docs/development-backlog.md)、[README](README.md)。
+[开发任务清单](docs/development-backlog.md)、[接续与验收记录](docs/progress-2026-09-22.md)、
+[产品暂停与人工处理](docs/product-operations.md)、[README](README.md)。
+
+对外对接包（`docs/handoff/`，发给香港、平台、法务、APP 等外部方的请求单与验收规划，未知项一律"待确认"）：
+[M1b](docs/handoff/m1b/request-hk.md)、[M2b+M3](docs/handoff/m2b-m3/request-dify.md)、[上线](docs/handoff/launch/request-app.md)。
