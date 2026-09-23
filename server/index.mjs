@@ -6,7 +6,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Store } from './store.mjs';
 import { Service } from './service.mjs';
 import { createAdapterRegistry } from './adapters/registry.mjs';
-import { createDifyClient } from './dify/dify-client.mjs';
+import { createDifyClient, DIFY_ENV_VARS } from './dify/dify-client.mjs';
 import { product, demoActors, demoKnowledge, statusLabels, followupStages } from './catalog.mjs';
 import { AppError, check } from './errors.mjs';
 
@@ -30,9 +30,10 @@ function exportedPackage(pack, client) {
 
 export function createApp({ database = process.env.HB_DATABASE || resolve(root, 'data/prototype.sqlite'), tick = true, serviceOptions = {} } = {}) {
   check(process.env.NODE_ENV !== 'production', 500, 'DEMO_ONLY', '当前是本地演示应用，禁止以 production 模式启动。');
-  check(!process.env.DIFY_API_URL && !process.env.DIFY_API_KEY, 500, 'DIFY_OFFLINE_ONLY', 'M2a-2 仅支持离线模式；真实 Dify 配置属于 M2b。');
+  check(!DIFY_ENV_VARS.some(name => process.env[name]), 500, 'DIFY_OFFLINE_ONLY', 'M2a-2 仅支持离线模式；真实 Dify 配置属于 M2b。');
   const registry = createAdapterRegistry({ pythonAdapterUrl: process.env.HB_PYTHON_ADAPTER_URL || null, strict: process.env.NODE_ENV === 'production' });
-  const dify = createDifyClient({ apiUrl: process.env.DIFY_API_URL || null, apiKey: process.env.DIFY_API_KEY || null });
+  // Offline until M2b: every Dify variable is rejected above, so this is the local engine.
+  const dify = createDifyClient();
   const store = new Store(database); const service = new Service(store, { registry, dify, ...serviceOptions });
   const interval = tick ? setInterval(() => service.tick().catch(() => {}), 300) : null;
   interval?.unref();

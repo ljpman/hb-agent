@@ -1,11 +1,22 @@
+// RL-01d: an amount next to benefit/return wording (e.g. 每年2万回报, 收益每年2万,
+// 每年1万美元现金价值) is a benefit figure, never a premium candidate.
+const BENEFIT_WORDS = '回报|回報|收益|分红|分紅|红利|紅利|派息|利息|现金价值|現金價值|退保价值|退保價值|领取|領取|返还|返還|提取|回本|赔偿|賠償';
+const BENEFIT_BEFORE_RE = new RegExp(`(?:${BENEFIT_WORDS})[^，,。；;！!？?\\n]{0,6}$`);
+const BENEFIT_AFTER_RE = new RegExp(`^\\s*(?:美元|美金|港币|港幣|港元|USD|HKD)?\\s*的?\\s*(?:${BENEFIT_WORDS})`, 'i');
+const nearBenefit = (text, match) => BENEFIT_BEFORE_RE.test(text.slice(Math.max(0, match.index - 12), match.index)) ||
+  BENEFIT_AFTER_RE.test(text.slice(match.index + match[0].length));
+
 // Conservative, deterministic candidates for the offline demo, never benefits.
 // Every accepted value retains an exact substring of the original input.
 export function extractParameters(text, product) {
   const params = {}, evidence = {}, conflicts = [];
   const fields = new Map(product.fields.map(field => [field.key, field]));
-  const collect = (key, matches, parse) => {
+  const collect = (key, matches, parse, { benefitGuard = false } = {}) => {
     const field = fields.get(key);
     if (!field || !matches.length) return;
+    if (benefitGuard && matches.some(match => nearBenefit(text, match))) {
+      conflicts.push(`${field.label}附近出现收益／回报等利益表述，不能当作${field.label}，请手动确认`); return;
+    }
     if (matches.some(match => /(?:不是|并非|是否|不确定|不清楚|可能|大约|约|\d\s*(?:到|至|[-~～—]))\s*$/.test(text.slice(Math.max(0, match.index - 10), match.index)) ||
         /^(?:\s*(?:到|至|[-~～—])\s*\d|\s*[？?])/.test(text.slice(match.index + match[0].length)))) {
       conflicts.push(`${field.label}描述不确定，请手动确认`); return;
@@ -46,7 +57,7 @@ export function extractParameters(text, product) {
     if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(m[1])) return;
     const cents = decimalCents(m[1].replaceAll(',', '')) * (m[2] ? 10000n : 1n);
     return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
-  });
+  }, { benefitGuard: true });
   collect('paymentTerm', [...text.matchAll(/(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*年(?:缴|交)|(?:缴费|交费|缴|交)\s*([+-]?\d+(?:\.\d+)?)\s*年/g)], m => {
     const raw = m[1] || m[2]; return /^\d+$/.test(raw) ? String(Number(raw)) : undefined;
   });

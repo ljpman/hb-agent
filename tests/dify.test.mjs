@@ -75,17 +75,18 @@ test('DifyClient：未配置时诚实降级到本地引擎，不伪称调用模�
 test('DifyClient：配置后走 HTTP，API key 只在请求头、user 由后端提供', async () => {
   let captured;
   const transport = async (url, init) => { captured = { url, init }; return { answer: 'ok', metadata: { intent: 'answer', source: '知识库' } }; };
-  const client = createDifyClient({ apiUrl: 'https://dify.example/v1/', apiKey: 'app-secret-key', transport });
+  const apiKeys = { chat: 'app-secret-chat-key', extract: 'app-secret-extract-key', compliance: 'app-secret-compliance-key' };
+  const client = createDifyClient({ apiUrl: 'https://dify.example/v1/', apiKeys, transport });
   assert.ok(client instanceof HttpDifyClient);
   assert.equal(client.status().dify, 'configured');
   await client.chat({ text: '你好', user: 'dify-internal-123' });
   assert.equal(captured.url, 'https://dify.example/v1/chat-messages');
-  assert.equal(captured.init.headers.Authorization, 'Bearer app-secret-key');
+  assert.equal(captured.init.headers.Authorization, 'Bearer app-secret-chat-key');
   const body = JSON.parse(captured.init.body);
   assert.equal(body.user, 'dify-internal-123');
   assert.equal(body.query, '你好');
-  // The key must never travel in the request body.
-  assert.ok(!captured.init.body.includes('app-secret-key'));
+  // No key (of any app) may travel in the request body.
+  for (const key of Object.values(apiKeys)) assert.ok(!captured.init.body.includes(key));
 });
 
 test('assistant：出口审查在返回前完成，违规回复被拦并记审计', () => {

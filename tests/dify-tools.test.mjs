@@ -113,7 +113,7 @@ test('合规保存与查询：只存 hash、版本和判定；拒绝伪造出处
     const audit = response.body;
     assert.equal(audit.decision, 'block');
     assert.ok(audit.rules.includes('promise-language'));
-    assert.equal(audit.ruleVersion, 'm2a2-2');
+    assert.equal(audit.ruleVersion, 'm2a2-3');
     assert.equal(audit.originalHash, sha256(input.originalText));
     assert.equal(audit.draftReplyHash, sha256(input.draftReply));
     assert.notEqual(audit.replyHash, audit.draftReplyHash);
