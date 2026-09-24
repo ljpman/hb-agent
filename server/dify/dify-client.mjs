@@ -30,8 +30,8 @@ export const DIFY_APPS = Object.freeze({
   extract: 'proposal_extract',
   compliance: 'compliance_guard',
 });
-// Environment variable names reserved for M2b. The M2a-2 application entry must
-// REJECT every name in DIFY_ENV_VARS (server/index.mjs) so the prototype stays offline.
+// Environment variable names reserved for M2b. The default and strict application
+// modes reject every name in DIFY_ENV_VARS; only explicit localhost dev mode accepts them.
 export const DIFY_APP_KEY_ENV = Object.freeze({
   chat: 'DIFY_CHAT_API_KEY',
   extract: 'DIFY_EXTRACT_API_KEY',
@@ -41,6 +41,14 @@ export const DIFY_ENV_VARS = Object.freeze(['DIFY_API_URL', 'DIFY_API_KEY', ...O
 
 const notConfigured = app => new AppError(503, 'DIFY_APP_NOT_CONFIGURED', `Dify 应用 ${DIFY_APPS[app]} 未配置，该能力暂不可用，未调用 Dify。`);
 const validUser = value => typeof value === 'string' && /^[\w-]{1,100}$/.test(value);
+function inferIntent(text) {
+  const query = String(text ?? '').normalize('NFKC');
+  if (/进度|進度|任务状态|任務狀態|保单进展|保單進展/.test(query)) return 'progress';
+  if (/提醒|跟进|跟進|回访|回訪|联系|聯絡|联络/.test(query)) return 'followup';
+  if (/计划书|計劃書|建议书|建議書|出计划|出計劃|生成计划|生成計劃|直接(?:帮我)?提交|提交并忽略|马上生成/.test(query)) return 'proposal';
+  if (/条款|條款|投保|保费|保費|现金价值|現金價值|退保价值|退保價值|保障|收益|回报|回報|产品|產品/.test(query)) return 'knowledge';
+  return null;
+}
 
 async function fetchTransport(url, init) {
   const res = await fetch(url, init);
@@ -102,9 +110,35 @@ export class HttpDifyClient {
     }
   }
 
-  async chat({ text, user }) {
-    const out = await this.#run('chat', '/chat-messages', user, { inputs: {}, query: text });
-    return { kind: out?.metadata?.intent || 'answer', answer: out?.answer ?? '', source: out?.metadata?.source ?? null, engine: 'dify' };
+  async chat({ text, user, conversation_id = null }) {
+    const out = await this.#run('chat', '/chat-messages', user, {
+      inputs: {}, query: text, ...(typeof conversation_id === 'string' ? { conversation_id } : {}),
+    });
+    if (typeof out?.answer !== 'string' || !out.answer.trim() || out.answer.length > 6000) {
+      throw new AppError(502, 'DIFY_RESULT_INVALID', 'Dify 助手结果不可核实，请人工处理。');
+    }
+    let answer = out.answer;
+    let modelIntent = null;
+    try {
+      const envelope = JSON.parse(out.answer);
+      if (envelope && typeof envelope.answer === 'string' && envelope.answer.trim() && envelope.answer.length <= 3000) {
+        answer = envelope.answer;
+        modelIntent = envelope.metadata?.intent;
+      }
+    } catch { /* A plain-text answer remains subject to the backend exit guard. */ }
+    // The Dify workflow may label a clear request as `unknown`. Preserve the
+    // stable API taxonomy for unambiguous intents using a backend rule; only use
+    // the model label where the backend has no matching rule.
+    let intent = inferIntent(text) || modelIntent;
+    if (!['proposal', 'progress', 'followup', 'knowledge', 'unknown'].includes(intent)) intent = 'unknown';
+    // No knowledge base is configured in the M2b dev edition. Do not expose a
+    // model-generated product-fact answer even if the prompt is ignored.
+    if (intent === 'knowledge') answer = '当前没有已核验知识库，无法核实该产品事实，请以保司官方条款为准并由经纪核对。';
+    // The M2b workspace has no verified knowledge base. Ignore all model-supplied
+    // citation/source claims; only a later M3 retrieval validator may populate it.
+    const metadata = { intent, source: null };
+    const difyConversationId = typeof out.conversation_id === 'string' && /^[\w-]{1,100}$/.test(out.conversation_id) ? out.conversation_id : null;
+    return { kind: intent, answer, source: null, metadata, engine: 'dify', difyConversationId };
   }
 
   async extractParams({ text, product, user }) {

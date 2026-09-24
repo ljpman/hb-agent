@@ -1,6 +1,6 @@
 # HB-Agent · 保险经纪智能体
 
-当前状态：**第一版本地交互原型已可运行**。它把经纪从需求描述到后续跟进的主流程做成了一套可操作工作台；真实保司门户、香港 Python、Dify 和 APP IM 仍待接入。页面和文件会持续标注“演示／模拟”，不会让模拟结果看起来像保司官方材料。
+当前状态：**第一版本地交互原型已可运行**。它把经纪从需求描述到后续跟进的主流程做成了一套可操作工作台；真实保司门户、香港 Python 和 APP IM 仍待接入。M2b 开发联调版的三个 `hb-agent-dev-*` 工作流已在本机 Dify 发布，Dify UI 中 10 个虚构预览样例通过；本机 Node 后端 → Dify 实际验收 116/116 通过，完整离线测试 222/222 通过。Dify → 后端工具调用仍未接通；计划中的香港正式环境验收仍未完成。页面和文件会持续标注“演示／模拟”，不会让模拟结果看起来像保司官方材料。
 
 首期目标：官方计划书生成、带出处的讲解包、轻量客户跟进卡，并在 APP 中完成问答、参数确认、任务查询和通知。
 
@@ -24,15 +24,37 @@
 ```powershell
 python -m pip install -r requirements.txt
 $env:HB_PYTHON = (Get-Command python).Source
-node server/index.mjs
+node --env-file-if-exists=.env server/index.mjs
 ```
 
 浏览器打开 `http://127.0.0.1:4318`。服务只绑定本机地址，并拒绝 production 模式启动。
+
+### M2b 本机开发联调
+
+开发联调只使用虚构数据，不是审批过的香港正式环境。把三个应用各自的 API key 放在项目根目录 `.env`，不要放进代码、日志或审计：
+
+```dotenv
+HB_DIFY_MODE=dev
+DIFY_API_URL=http://localhost/v1
+DIFY_CHAT_API_KEY=...  # hb-agent-dev-broker_assistant_chat
+DIFY_EXTRACT_API_KEY=...  # hb-agent-dev-proposal_extract
+DIFY_COMPLIANCE_API_KEY=...  # hb-agent-dev-compliance_guard
+```
+
+应用入口按 chat、extract、compliance 分别使用对应 key；不支持共享 key。严格模式和 production 模式拒绝 Dify 配置。`/api/bootstrap` 会显示“M2b 开发联调版”；未建知识库时，产品事实问题必须回答“无法核实”。三个开发工作流均已发布；DSL 存放于 [`dify/dsl/`](dify/dsl/)，工作流与验收状态以 [`docs/m2b-dev.md`](docs/m2b-dev.md) 记录为准。
 
 ```powershell
 node --test tests/*.test.mjs
 node scripts/build_demo_pdf.mjs
 ```
+
+真实 Dify 检查须在三个开发应用各自 API key 已写入根目录 `.env` 后单独运行，不属于默认离线测试。请由操作人员在 Dify 控制台生成 key 并直接写入本机文件，不要发送到聊天。验收脚本静态估算会发起 181 次 Dify API 请求（不含重试），可能产生模型费用；本机已在授权后运行，最终 116 条验收执行全部通过：
+
+```powershell
+node --env-file-if-exists=.env scripts/check-dify-dev.mjs
+```
+
+脚本只使用虚构输入，红线用例重复 10 次（暂定值），不输出 key 或 Dify 原始回复。Dify → 后端工具尚未接入。逐轮失败与修复过程见 [`docs/m2b-dev.md`](docs/m2b-dev.md)。
 
 如果电脑已安装 npm，也可以使用 `npm start`、`npm test` 和 `npm run build:demo-pdf`。
 
@@ -66,7 +88,7 @@ npm start
 - 适配器结果不能覆盖身份或确认快照；拒绝非法状态跳转，状态／文件和对应审计原子落库。
 - 真实候选文件只能由业务服务的确定性核验器按确认快照逐字段核对后交付；目前没有任何真实产品规则，真实文件仍一律转人工。样本包到位后用 `node scripts/check-samples.mjs <目录>` 做接收检查。
 - M2a-2 离线工具网关、持久合规审计／回调去重及工作台合规参数卡；真实进度仍返回 not-configured。
-- M2a-2 启动拒绝任一预留 Dify 变量（`DIFY_API_URL`、`DIFY_API_KEY` 及三个应用各自的 key，见 `DIFY_ENV_VARS`），真实 Dify 接入留待 M2b。
+- M2a-2 默认启动拒绝任一预留 Dify 变量（`DIFY_API_URL`、`DIFY_API_KEY` 及三个应用各自的 key，见 `DIFY_ENV_VARS`）；只有显式 `HB_DIFY_MODE=dev` 才会读取本机 Dify URL 和按应用 key。
 
 ## 接入香港现有 Python 后怎么替换
 
@@ -83,6 +105,7 @@ npm start
 - [Dify 工作流实施计划](docs/dify-workflow-plan.md)：五天实施、三个工作流、接口、安全边界和验收样例。
 - [M2a-2 离线工具契约与自验收](docs/m2a2-offline-tools.md)：签名与权限、接口字段、状态／文件边界、35 项离线测试与未完成部分。
 - [最新接续与验收记录](docs/progress-2026-09-22.md)：本地修复、运行环境、完整流程验证和真实接入待办。
+- [M2b 开发联调版记录](docs/m2b-dev.md)：本机 Dify 联调与逐轮验收结果、仍未接入的工具链及正式环境状态。
 - [产品暂停与人工处理](docs/product-operations.md)：运营操作、接口、持久状态和异常处理边界。
 - [架构与工程评审 v2](docs/insurance-agent-v2.md)：原方案修正、接口与安全边界。
 

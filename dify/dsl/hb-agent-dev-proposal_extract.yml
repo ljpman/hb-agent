@@ -1,0 +1,288 @@
+app:
+  description: 'M2b 开发联调版确定性抽取；仅用原文证据，不生成金额或收益。'
+  icon: 🤖
+  icon_background: '#FFEAD5'
+  icon_type: emoji
+  mode: workflow
+  name: hb-agent-dev-proposal_extract
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/deepseek:0.0.24@9e12eef09973667f0eaf4f082af883167e1de88740b22e71e71488d020c3778a
+    version: null
+kind: app
+version: 0.7.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features: {}
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: start
+        targetType: code
+      id: start-code
+      source: start
+      sourceHandle: source
+      target: code
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: end
+      id: code-end
+      source: code
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - label: 产品编号
+          max_length: 48
+          options: []
+          required: true
+          type: text-input
+          variable: product_id
+        - label: 字段版本
+          max_length: 48
+          options: []
+          required: true
+          type: text-input
+          variable: schema_version
+        - label: 经纪需求原文
+          max_length: 3000
+          options: []
+          required: true
+          type: paragraph
+          variable: text
+      height: 130
+      id: start
+      position:
+        x: 80
+        y: 282
+      positionAbsolute:
+        x: 80
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |-
+          import re
+
+          KEYS = ["age", "gender", "smoker", "currency", "annualPremium", "paymentTerm"]
+          BENEFIT = re.compile(r"回报|回報|收益|分红|分紅|红利|紅利|派息|利息|现金价值|現金價值|退保价值|退保價值|领取|領取|返还|返還|提取|回本|赔偿|賠償")
+
+          def main(product_id: str, schema_version: str, text: str) -> dict:
+              params = {}
+              evidence = {}
+              conflicts = []
+              ambiguous_fields = []
+              if product_id != "demo-savings-01" or schema_version != "1":
+                  conflicts.append("产品字段版本已变化，请从业务后端重新读取字段定义")
+                  return {"params": params, "evidence": evidence, "conflicts": conflicts, "missing": KEYS}
+
+              def put(key, matches, parser, label, low=None, high=None):
+                  if not matches:
+                      return
+                  values = [parser(item) for item in matches]
+                  if any(value is None for value in values):
+                      conflicts.append(label + "格式无法核实，请手动确认")
+                      return
+                  if len(set(value for value, _ in values)) > 1:
+                      conflicts.append(label + "存在多个不同值，请手动确认")
+                      return
+                  value, raw = values[0]
+                  if low is not None and (value < low or value > high):
+                      conflicts.append(label + "超出演示字段范围，请手动确认")
+                      return
+                  params[key] = value
+                  evidence[key] = raw
+
+              ages = list(re.finditer(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*岁", text))
+              def age_value(m):
+                  raw_num = m.group(1)
+                  if not raw_num.isdigit():
+                      return None, m.group(0)
+                  return int(raw_num), m.group(0)
+              put("age", ages, age_value, "年龄", 18, 70)
+
+              genders = list(re.finditer(r"被保险人(?:性别)?[：:\s]*(男|女)", text))
+              put("gender", genders, lambda m: (m.group(1), m.group(0)), "性别")
+
+              smoking_matches = list(re.finditer(r"不吸烟|不抽烟|非吸烟|吸烟|抽烟", text))
+              smoking = [m for m in smoking_matches if m.group(0) not in ("吸烟", "抽烟") or not re.match(r"^(?:状态|情况)", text[m.end():])]
+              uncertain = any(
+                  re.search(r"是否|不确定|不清楚|未知|未确认|未说明|没有说明|并非|不是|可能|以前|曾经|戒烟|戒$", text[max(0, m.start()-8):m.start()])
+                  or re.match(r"^(?:(?:状态(?:是|为|[：:]|\s)*)?(?:未知|不确定|不清楚|未确认|未说明)|(?:还|但)(?:未知|不确定|不清楚|未确认|未说明)|[？?])", text[m.end():m.end()+16])
+                  for m in smoking_matches
+              )
+              if uncertain:
+                  conflicts.append("吸烟状态描述不确定，请手动确认")
+              else:
+                  put("smoker", smoking, lambda m: (not m.group(0).startswith(("不", "非")), m.group(0)), "吸烟状态")
+
+              currency_matches = list(re.finditer(r"美元|美金|港币|港元|(?<![A-Za-z])(?:USD|HKD)(?![A-Za-z])", text, re.I))
+              currencies = [("USD" if m.group(0).lower() in ("美元", "美金", "usd") else "HKD", m.group(0)) for m in currency_matches]
+              if len(set(value for value, _ in currencies)) > 1:
+                  conflicts.append("币种存在多个不同值，请手动确认")
+              elif currencies:
+                  params["currency"] = currencies[0][0]
+                  evidence["currency"] = currencies[0][1]
+
+              premiums = list(re.finditer(r"(?:年缴|年交|每年)\s*(?:(?:USD|HKD|美元|美金|港币|港元)\s*)?([+-]?\d[\d,.]*(?:[eE][+-]?\d+)?)\s*(万)?", text, re.I))
+              if premiums and any(BENEFIT.search(text[max(0, m.start()-18):m.start()]) or BENEFIT.search(text[m.end():m.end()+18]) for m in premiums):
+                  conflicts.append("年缴保费附近出现收益等利益表述，不能当作保费，请手动确认")
+              else:
+                  parsed = []
+                  for m in premiums:
+                      raw_num = m.group(1)
+                      if not re.fullmatch(r"(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?", raw_num):
+                          parsed.append((None, m.group(0)))
+                          continue
+                      clean = raw_num.replace(",", "")
+                      whole, dot, fraction = clean.partition(".")
+                      cents = int(whole) * 100 + int((fraction + "00")[:2])
+                      if m.group(2):
+                          cents *= 10000
+                      amount = f"{cents // 100}.{cents % 100:02d}"
+                      parsed.append((amount, m.group(0)))
+                  if parsed:
+                      if any(value is None for value, _ in parsed):
+                          conflicts.append("年缴保费格式无法核实，请手动确认")
+                      elif len(set(value for value, _ in parsed)) > 1:
+                          conflicts.append("年缴保费存在多个不同值，请手动确认")
+                      else:
+                          amount = int(parsed[0][0].split(".")[0])
+                          if amount < 1000 or amount > 1000000:
+                              conflicts.append("年缴保费超出演示字段范围，请手动确认")
+                          else:
+                              params["annualPremium"] = parsed[0][0]
+                              evidence["annualPremium"] = parsed[0][1]
+
+              terms = list(re.finditer(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*年(?:缴|交)|(?:缴费|交费|缴|交)\s*([+-]?\d+(?:\.\d+)?)\s*年", text))
+              term_values = []
+              for m in terms:
+                  raw_num = m.group(1) or m.group(2)
+                  term_values.append((str(int(raw_num)) if raw_num.isdigit() else None, m.group(0)))
+              if any(value is None for value, _ in term_values):
+                  conflicts.append("缴费年期格式无法核实，请手动确认")
+              elif len(set(value for value, _ in term_values)) > 1:
+                  conflicts.append("缴费年期存在多个不同值，请手动确认")
+              elif term_values:
+                  if term_values[0][0] not in ("5", "10"):
+                      conflicts.append("缴费年期超出演示字段范围，请手动确认")
+                  else:
+                      params["paymentTerm"] = term_values[0][0]
+                      evidence["paymentTerm"] = term_values[0][1]
+
+              for key in set(ambiguous_fields or []):
+                  if key in KEYS:
+                      params.pop(key, None)
+                      evidence.pop(key, None)
+                      conflicts.append(key + "经语义检查提示不确定，请手动确认")
+
+              missing = [key for key in KEYS if key not in params]
+              return {"params": params, "evidence": evidence, "conflicts": conflicts, "missing": missing}
+        code_language: python3
+        outputs:
+          params:
+            children: null
+            type: object
+          evidence:
+            children: null
+            type: object
+          conflicts:
+            children: null
+            type: array[string]
+          missing:
+            children: null
+            type: array[string]
+        selected: false
+        title: 确定性抽取与校验
+        type: code
+        variables:
+        - value_selector:
+          - start
+          - product_id
+          variable: product_id
+        - value_selector:
+          - start
+          - schema_version
+          variable: schema_version
+        - value_selector:
+          - start
+          - text
+          variable: text
+      height: 150
+      id: code
+      position:
+        x: 680
+        y: 282
+      positionAbsolute:
+        x: 680
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - code
+          - params
+          value_type: object
+          variable: params
+        - value_selector:
+          - code
+          - evidence
+          value_type: object
+          variable: evidence
+        - value_selector:
+          - code
+          - conflicts
+          value_type: array[string]
+          variable: conflicts
+        - value_selector:
+          - code
+          - missing
+          value_type: array[string]
+          variable: missing
+        selected: false
+        title: 输出抽取结果
+        type: end
+      height: 170
+      id: end
+      position:
+        x: 980
+        y: 282
+      positionAbsolute:
+        x: 980
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: 0
+      y: 0
+      zoom: 1
+  rag_pipeline_variables: []

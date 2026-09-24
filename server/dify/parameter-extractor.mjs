@@ -42,23 +42,29 @@ export function extractParameters(text, product) {
     params[key] = candidates[0].value;
     evidence[key] = candidates[0].raw;
   };
-  collect('age', [...text.matchAll(/(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*岁/g)], m => Number(m[1]));
-  collect('gender', [...text.matchAll(/被保险人(?:性别)?[：:\s]*(男|女)/g)], m => m[1]);
-  const smoking = [...text.matchAll(/不吸烟|不抽烟|非吸烟|吸烟|抽烟/g)];
-  const uncertainSmoking = smoking.some(m => /是否|不确定|不清楚|未知|未确认|未说明|没有说明|并非|不是|可能|以前|曾经|戒烟|戒$/.test(text.slice(Math.max(0, m.index - 8), m.index)) || /^(?:状态)?(?:未知|不确定|未确认)|^[？?]/.test(text.slice(m.index + m[0].length)));
+  collect('age', [...text.matchAll(/(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*[岁歲]/g)], m => Number(m[1]));
+  collect('gender', [...text.matchAll(/被(?:保险|保險)人(?:性别|性別)?[：:\s]*(男|女)/g)], m => m[1]);
+  const smokingMatches = [...text.matchAll(/不吸烟|不吸煙|不抽烟|不抽煙|非吸烟|非吸煙|吸烟|吸煙|抽烟|抽煙/g)];
+  const smoking = smokingMatches.filter(m => !/^(?:吸烟|吸煙|抽烟|抽煙)$/.test(m[0]) || !/^(?:状态|狀態|情况|情況)/.test(text.slice(m.index + m[0].length)));
+  const uncertainSmoking = smokingMatches.some(m => {
+    const before = text.slice(Math.max(0, m.index - 8), m.index);
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 16);
+    return /是否|不确定|不確定|不清楚|未知|未确认|未確認|未说明|未說明|没有说明|沒有說明|并非|並非|不是|可能|以前|曾经|曾經|戒烟|戒煙|戒$/.test(before) ||
+      /^(?:(?:状态|狀態|情况|情況)?(?:是|为|為|[：:]|\s)*(?:未知|不确定|不確定|不清楚|未确认|未確認|未说明|未說明)|(?:还|還|但)(?:未知|不确定|不確定|不清楚|未确认|未確認|未说明|未說明)|[？?])/.test(after);
+  });
   if (uncertainSmoking) conflicts.push('吸烟状态无法明确，请手动确认');
   else collect('smoker', smoking, m => !/^(不|非)/.test(m[0]));
-  collect('currency', [...text.matchAll(/美元|美金|港币|港元|人民币|(?<![A-Za-z])(?:USD|HKD|CNY|RMB|EUR|GBP)(?![A-Za-z])/gi)], m => {
+  collect('currency', [...text.matchAll(/美元|美金|港币|港幣|港元|人民币|人民幣|(?<![A-Za-z])(?:USD|HKD|CNY|RMB|EUR|GBP)(?![A-Za-z])/gi)], m => {
     if (/美元|美金|^USD$/i.test(m[0])) return 'USD';
-    if (/港币|港元|^HKD$/i.test(m[0])) return 'HKD';
+    if (/港币|港幣|港元|^HKD$/i.test(m[0])) return 'HKD';
   });
-  collect('annualPremium', [...text.matchAll(/(?:年缴|年交|每年)\s*(?:(?:USD|HKD|美元|美金|港币|港元)\s*)?([+-]?\d[\d,.]*(?:[eE][+-]?\d+)?)\s*(万)?/gi)], m => {
+  collect('annualPremium', [...text.matchAll(/(?:年缴|年繳|年交|每年)\s*(?:(?:USD|HKD|美元|美金|港币|港幣|港元)\s*)?([+-]?\d[\d,.]*(?:[eE][+-]?\d+)?)\s*(万|萬)?/gi)], m => {
     // Do not truncate precision, scientific notation or malformed grouping.
     if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(m[1])) return;
     const cents = decimalCents(m[1].replaceAll(',', '')) * (m[2] ? 10000n : 1n);
     return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
   }, { benefitGuard: true });
-  collect('paymentTerm', [...text.matchAll(/(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*年(?:缴|交)|(?:缴费|交费|缴|交)\s*([+-]?\d+(?:\.\d+)?)\s*年/g)], m => {
+  collect('paymentTerm', [...text.matchAll(/(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*年(?:缴|繳|交)|(?:缴费|繳費|交费|交費|缴|繳|交)\s*([+-]?\d+(?:\.\d+)?)\s*年/g)], m => {
     const raw = m[1] || m[2]; return /^\d+$/.test(raw) ? String(Number(raw)) : undefined;
   });
   return { productId: product.id, schemaVersion: product.schemaVersion, params, evidence, conflicts,

@@ -11,6 +11,10 @@ const accepted = [
   ['35岁，确认35岁', 'age', 35], ['被保险人男', 'gender', '男'], ['被保险人性别：女', 'gender', '女'],
   ['被保险人性别 男', 'gender', '男'], ['不吸烟', 'smoker', false], ['不抽烟', 'smoker', false],
   ['非吸烟', 'smoker', false], ['吸烟', 'smoker', true], ['抽烟', 'smoker', true],
+  ['吸烟状态：不吸烟', 'smoker', false],
+  ['35歲', 'age', 35], ['被保險人性別：女', 'gender', '女'], ['不吸煙', 'smoker', false],
+  ['不抽煙', 'smoker', false], ['吸煙狀態：不吸煙', 'smoker', false], ['港幣', 'currency', 'HKD'],
+  ['年繳1.5萬港幣', 'annualPremium', '15000.00'], ['5年繳', 'paymentTerm', '5'],
   ['不吸烟，非吸烟', 'smoker', false], ['美元', 'currency', 'USD'], ['美金', 'currency', 'USD'],
   ['usd', 'currency', 'USD'], ['港币', 'currency', 'HKD'], ['港元', 'currency', 'HKD'],
   ['HKD', 'currency', 'HKD'], ['美元 USD 美金', 'currency', 'USD'],
@@ -27,6 +31,8 @@ const rejected = [
   ['被保险人男，被保险人女', 'gender'], ['被保险人性别女？', 'gender'],
   ['不吸烟，吸烟', 'smoker'], ['非吸烟，实际吸烟', 'smoker'], ['不抽烟，但抽烟', 'smoker'],
   ['是否吸烟', 'smoker'], ['不是不吸烟', 'smoker'], ['吸烟状态未知', 'smoker'], ['以前吸烟', 'smoker'],
+  ['71歲', 'age'], ['吸煙狀態未知', 'smoker'], ['不吸煙，吸煙', 'smoker'],
+  ['年繳1萬，年繳2萬', 'annualPremium'], ['5年繳和10年繳', 'paymentTerm'],
   ['美元和港元', 'currency'], ['人民币', 'currency'], ['USD和EUR', 'currency'],
   ['年缴1万，年缴2万', 'annualPremium'], ['年缴1000.123', 'annualPremium'], ['年缴1.234万', 'annualPremium'],
   ['年缴1,00', 'annualPremium'], ['年缴1e4', 'annualPremium'], ['年缴-10000', 'annualPremium'],
@@ -71,7 +77,7 @@ test('完整输入可验证；助手冲突参数留空且不会产生草稿或�
   try {
     const service = new Service(store);
     const text = '陈先生35岁，不吸烟，被保险人性别男，年缴1万美元，5年缴';
-    const result = service.extract(text);
+    const result = service.extract(text, demoActors.broker);
     assert.deepEqual(service.validate(result.params), result.params);
     const reply = service.assistant(demoActors.broker, '陈先生35岁，不吸烟，年缴1万美元，年缴2万美元，5年缴', 'client-chen');
     assert.equal(reply.compliance.decision, 'allow');

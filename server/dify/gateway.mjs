@@ -3,7 +3,7 @@ import { check } from '../errors.mjs';
 import { evaluateCompliance, COMPLIANCE_VERSION, hasUnverifiedNumber } from './compliance.mjs';
 
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
-export const MANUAL_REPLY = '这条回复未通过合规出口检查，已转人工核对。';
+export const MANUAL_REPLY = '无法核实，该回复未通过合规出口检查，已转人工核对。';
 const uid = prefix => `${prefix}-${randomUUID()}`;
 const validId = value => typeof value === 'string' && /^[\w-]{1,100}$/.test(value);
 const textField = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 3000;
@@ -16,7 +16,7 @@ export function signToolRequest(actorToken, method, path, timestamp, nonce, rawB
   return createHmac('sha256', actorToken).update([method, path, timestamp, nonce, sha256(rawBody)].join('\n')).digest('hex');
 }
 
-export function saveCompliance(store, actor, now, { originalText, draftReply, citations = [], runId = null, clientId = null }) {
+export function saveCompliance(store, actor, now, { originalText, draftReply, citations = [], runId = null, clientId = null, semanticReview = null }) {
   const verdict = evaluateCompliance({ text: draftReply, citations });
   // M2a-2 has no verified official numerical source. Tool/model-supplied source
   // labels cannot authorize numbers (including premiums and coverage amounts).
@@ -24,7 +24,30 @@ export function saveCompliance(store, actor, now, { originalText, draftReply, ci
     verdict.decision = 'block';
     if (!verdict.rules.includes('unverified-number')) verdict.rules.push('unverified-number');
   }
-  const reply = verdict.decision === 'block' ? MANUAL_REPLY : draftReply;
+  const semanticRules = Array.isArray(semanticReview?.rules)
+    ? semanticReview.rules.filter(rule => typeof rule === 'string' && /^[\w-]{1,64}$/.test(rule)).slice(0, 20)
+    : [];
+  let safeReply = draftReply;
+  if (semanticReview) {
+    verdict.rules.push(...semanticRules.filter(rule => !verdict.rules.includes(rule)));
+    if (semanticReview.decision === 'block') {
+      verdict.decision = 'block';
+      if (!verdict.rules.includes('semantic-review-blocked')) verdict.rules.push('semantic-review-blocked');
+    } else if (semanticReview.decision === 'rewrite') {
+      const rewritten = semanticReview.reply;
+      const recheck = typeof rewritten === 'string' && rewritten.trim() && rewritten.length <= 3000
+        ? evaluateCompliance({ text: rewritten, citations: [] }) : null;
+      if (verdict.decision === 'allow' && recheck?.decision === 'allow' && !hasUnverifiedNumber(rewritten)) safeReply = rewritten;
+      else {
+        verdict.decision = 'block';
+        if (!verdict.rules.includes('rewrite-rejected')) verdict.rules.push('rewrite-rejected');
+      }
+    } else if (semanticReview.decision !== 'allow') {
+      verdict.decision = 'block';
+      if (!verdict.rules.includes('semantic-review-invalid')) verdict.rules.push('semantic-review-invalid');
+    }
+  }
+  const reply = verdict.decision === 'block' ? MANUAL_REPLY : safeReply;
   const audit = {
     id: verdict.auditId, auditId: verdict.auditId, tenantId: actor.tenantId, ownerId: actor.id,
     runId, clientId, decision: verdict.decision, rules: verdict.rules, ruleVersion: COMPLIANCE_VERSION,
@@ -56,7 +79,7 @@ export class DifyGateway {
     let record = this.store.get('dify-conversation', id);
     if (!record) record = this.store.put('dify-conversation', {
       id, tenantId: actor.tenantId, ownerId: actor.id, clientId,
-      user: uid('dify-user'), conversation_id: uid('dify-conversation'), status: 'not-configured',
+      user: uid('dify-user'), conversation_id: uid('dify-conversation'), difyConversationId: null, status: 'not-configured',
     });
     return record;
   }

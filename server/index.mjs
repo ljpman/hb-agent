@@ -6,7 +6,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { Store } from './store.mjs';
 import { Service } from './service.mjs';
 import { createAdapterRegistry } from './adapters/registry.mjs';
-import { createDifyClient, DIFY_ENV_VARS } from './dify/dify-client.mjs';
+import { createDifyClient, DIFY_APP_KEY_ENV, DIFY_ENV_VARS } from './dify/dify-client.mjs';
 import { product, demoActors, demoKnowledge, statusLabels, followupStages } from './catalog.mjs';
 import { AppError, check } from './errors.mjs';
 
@@ -28,12 +28,39 @@ function exportedPackage(pack, client) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>演示讲解包</title><style>body{font:16px/1.8 system-ui,sans-serif;color:#193b35;max-width:800px;margin:48px auto;padding:24px}h1{font-size:28px}h2{font-size:20px;margin-top:30px}aside{background:#fbf1df;padding:16px}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}small{color:#576961}pre{white-space:pre-wrap;font:inherit}</style><h1>方案讲解包 · 演示版</h1><aside>模拟材料，不构成保司计划书或投保建议。当前没有真实产品利益数据。以下参数来源于模拟参数确认单第 1 页。</aside><p>${escapeHtml(client.name)}（演示客户） · 方案 V${pack.job.version} · 讲解包修订 ${pack.revision}</p><table><tbody>${pack.facts.map(f => `<tr><th>${escapeHtml(f.label)}</th><td>${escapeHtml(f.value)}</td></tr>`).join('')}</tbody></table>${pack.sections.map(s => `<h2>${escapeHtml(s.title)}</h2><p>${escapeHtml(s.text)}</p>`).join('')}<h2>沟通备注</h2><pre>${escapeHtml(pack.note)}</pre><small>本次复核：${escapeHtml(pack.reviewedBy)} · ${escapeHtml(pack.reviewedAt)}<br>该导出为独立版本。后续方案变化时应重新核对。</small></html>`;
 }
 
-export function createApp({ database = process.env.HB_DATABASE || resolve(root, 'data/prototype.sqlite'), tick = true, serviceOptions = {} } = {}) {
-  check(process.env.NODE_ENV !== 'production', 500, 'DEMO_ONLY', '当前是本地演示应用，禁止以 production 模式启动。');
-  check(!DIFY_ENV_VARS.some(name => process.env[name]), 500, 'DIFY_OFFLINE_ONLY', 'M2a-2 仅支持离线模式；真实 Dify 配置属于 M2b。');
-  const registry = createAdapterRegistry({ pythonAdapterUrl: process.env.HB_PYTHON_ADAPTER_URL || null, strict: process.env.NODE_ENV === 'production' });
-  // Offline until M2b: every Dify variable is rejected above, so this is the local engine.
-  const dify = createDifyClient();
+function difyRuntime(env) {
+  const mode = env.HB_DIFY_MODE || '';
+  const strict = env.NODE_ENV === 'production' || env.HB_STRICT_MODE === 'true';
+  const present = DIFY_ENV_VARS.filter(name => Object.hasOwn(env, name));
+  if (strict) {
+    check(mode !== 'dev' && present.length === 0, 500, 'DIFY_STRICT_ONLY', '严格或 production 模式拒绝所有 Dify 配置。');
+    return { client: createDifyClient(), dev: false };
+  }
+  check(mode === '' || mode === 'dev', 500, 'DIFY_MODE_INVALID', 'HB_DIFY_MODE 只接受显式值 dev。');
+  if (mode !== 'dev') {
+    check(present.length === 0, 500, 'DIFY_OFFLINE_ONLY', '默认离线模式拒绝所有 Dify 环境变量；联调需显式设置 HB_DIFY_MODE=dev。');
+    return { client: createDifyClient(), dev: false };
+  }
+  check(!present.includes('DIFY_API_KEY'), 500, 'DIFY_KEY_AMBIGUOUS', '开发联调只接受按应用区分的 Dify key。');
+  const apiUrl = env.DIFY_API_URL || null;
+  const apiKeys = Object.fromEntries(Object.entries(DIFY_APP_KEY_ENV).map(([app, name]) => [app, env[name] || undefined]));
+  const hasKey = Object.values(apiKeys).some(Boolean);
+  check(!hasKey || apiUrl, 500, 'DIFY_CONFIG_INVALID', '配置 Dify 应用 key 时必须同时配置本机 DIFY_API_URL。');
+  if (apiUrl) {
+    let parsed;
+    try { parsed = new URL(apiUrl); } catch { throw new AppError(500, 'DIFY_URL_INVALID', '开发联调 Dify 地址无效。'); }
+    check(['http:', 'https:'].includes(parsed.protocol) && ['localhost', '127.0.0.1'].includes(parsed.hostname.toLowerCase()) &&
+      !parsed.username && !parsed.password && !parsed.search && !parsed.hash && (!parsed.pathname || parsed.pathname === '/' || parsed.pathname === '/v1'),
+    500, 'DIFY_URL_NOT_LOCAL', '开发联调只允许本机 localhost 或 127.0.0.1 Dify 地址。');
+  }
+  return { client: createDifyClient({ apiUrl, apiKeys }), dev: true };
+}
+
+export function createApp({ database = process.env.HB_DATABASE || resolve(root, 'data/prototype.sqlite'), tick = true, serviceOptions = {}, env = process.env } = {}) {
+  check(env.NODE_ENV !== 'production', 500, 'DEMO_ONLY', '当前是本地演示应用，禁止以 production 模式启动。');
+  const difyConfig = difyRuntime(env);
+  const registry = createAdapterRegistry({ pythonAdapterUrl: env.HB_PYTHON_ADAPTER_URL || null, strict: env.HB_STRICT_MODE === 'true' });
+  const dify = difyConfig.client;
   const store = new Store(database); const service = new Service(store, { registry, dify, ...serviceOptions });
   const interval = tick ? setInterval(() => service.tick().catch(() => {}), 300) : null;
   interval?.unref();
@@ -85,7 +112,9 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
           actor, isMock: true, product, productAvailability: service.productAvailability(actor), clients: store.list('client', actor), jobs: store.list('job', actor),
           events: store.list('event', actor).slice(0, 60), messages: store.list('message', actor).slice(0, 50).reverse(),
           knowledge: demoKnowledge, statusLabels, followupStages,
-          integrations: { python: service.registry.status().python, dify: service.dify.status().dify, im: 'prototype-only' }
+          edition: difyConfig.dev ? 'M2b 开发联调版' : '本地离线演示版',
+          integrations: { python: service.registry.status().python, dify: service.dify.status().dify,
+            difyMode: difyConfig.dev ? 'development' : 'offline', im: 'prototype-only' }
         });
         if (path === '/api/products' && req.method === 'GET') return json(200, { products: [product] });
         if (path === `/api/products/${product.id}/schema` && req.method === 'GET') return json(200, product);
@@ -96,7 +125,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
           const input = await body(req);
           check(input.productId === product.id, 422, 'PRODUCT_INVALID', '请选择演示产品。');
           check(input.schemaVersion === product.schemaVersion, 409, 'SCHEMA_CHANGED', '产品字段版本已变化，请重新读取字段定义。');
-          return json(200, await service.extract(input.text));
+          return json(200, await service.extract(input.text, actor));
         }
         if (path === '/api/assistant' && req.method === 'POST') { const input = await body(req); return json(200, await service.assistant(actor, input.text, input.clientId)); }
         let m;

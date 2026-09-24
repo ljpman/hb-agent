@@ -6,6 +6,7 @@ import { createAdapterRegistry } from './adapters/registry.mjs';
 import { createDifyClient } from './dify/dify-client.mjs';
 import { DifyGateway, saveCompliance } from './dify/gateway.mjs';
 import { LocalFallbackDifyClient } from './dify/local-fallback.mjs';
+import { extractParameters } from './dify/parameter-extractor.mjs';
 import { evaluateCompliance, COMPLIANCE_RULES } from './dify/compliance.mjs';
 import { createPdfVerifier, VERIFY } from './verify/pdf-verifier.mjs';
 
@@ -48,6 +49,13 @@ export class Service {
   audit(actor, type, subjectId, detail, clientId = null) {
     return this.store.put('event', { id: id('event'), tenantId: actor.tenantId, ownerId: actor.id,
       actorName: actor.name, type, subjectId, clientId, detail, createdAt: iso(this.now()) });
+  }
+  auditDifyFailure(actor, capability) {
+    this.audit(actor, 'dify.call-failed', capability, 'Dify 调用失败；已省略上游错误详情。');
+  }
+  safeDifyError(error) {
+    if (error instanceof AppError && ['DIFY_UNAVAILABLE', 'DIFY_APP_NOT_CONFIGURED', 'DIFY_RESULT_INVALID', 'DIFY_USER_REQUIRED'].includes(error.code)) return error;
+    return new AppError(502, 'DIFY_UNAVAILABLE', 'Dify 暂不可用，未获得回复，请稍后重试或转人工处理。');
   }
   eventForJob(job, type, detail) {
     this.audit({ id: job.ownerId, tenantId: job.tenantId, name: job.isMock ? '模拟执行服务' : '计划书执行服务' }, type, job.id, detail, job.clientId);
@@ -419,40 +427,110 @@ export class Service {
   checkAssistantInput(text) {
     check(!evaluateCompliance({ text }).rules.includes(COMPLIANCE_RULES.SENSITIVE), 422, 'SENSITIVE_INPUT', '请移除凭据或敏感标识，仅通过受控凭据引用配置。');
   }
-  extract(text) {
+  extract(text, actor) {
     // Extraction runs through the Dify seam; without a configured Dify it uses the
     // deliberately limited local engine and says so. Input validation stays here.
     check(typeof text === 'string' && text.length > 0 && text.length <= 3000, 422, 'TEXT_INVALID', '请输入 1–3000 字的需求。');
     this.checkAssistantInput(text);
-    return this.dify.extractParams({ text, product });
+    const conversation = this.difyGateway.conversation(actor);
+    const local = this.dify instanceof LocalFallbackDifyClient;
+    const finish = result => {
+      if (local) return result;
+      check(result && result.params && typeof result.params === 'object' && !Array.isArray(result.params) &&
+        result.evidence && typeof result.evidence === 'object' && !Array.isArray(result.evidence) &&
+        Array.isArray(result.conflicts) && Array.isArray(result.missing), 502, 'DIFY_RESULT_INVALID', 'Dify 抽取结果不可核实，请人工处理。');
+      // Only backend deterministic parsing may create numeric or enum candidates.
+      // The Dify result is required and shape-checked, but never authorizes values.
+      const verified = extractParameters(text, product);
+      return { ...verified, engine: 'dify', isMock: false,
+        warning: '已调用 Dify；参数值和原文依据由后端确定性规则重新提取，仍需经纪确认。' };
+    };
+    let pending;
+    try { pending = this.dify.extractParams({ text, product, user: conversation.user }); }
+    catch (error) { this.auditDifyFailure(actor, 'proposal_extract'); throw this.safeDifyError(error); }
+    if (pending && typeof pending.then === 'function') {
+      return pending.then(finish).catch(error => {
+        if (error.code === 'DIFY_RESULT_INVALID') { this.auditDifyFailure(actor, 'proposal_extract'); throw error; }
+        this.auditDifyFailure(actor, 'proposal_extract'); throw this.safeDifyError(error);
+      });
+    }
+    try { return finish(pending); }
+    catch (error) { this.auditDifyFailure(actor, 'proposal_extract'); throw this.safeDifyError(error); }
   }
   assistant(actor, text, clientId) {
     if (clientId) this.get(actor, 'client', clientId);
     check(typeof text === 'string' && text.trim().length > 0 && text.length <= 3000, 422, 'TEXT_INVALID', '请输入 1–3000 字的问题。');
     this.checkAssistantInput(text);
     const conversation = this.difyGateway.conversation(actor, clientId || null);
-    const draft = this.dify.chat({ text, product, user: conversation.user, conversation_id: conversation.conversation_id });
-    const finish = draft => this.store.transaction(() => {
-      check(draft && typeof draft.answer === 'string' && draft.answer.trim() && draft.answer.length <= 3000, 502, 'DIFY_RESULT_INVALID', '助手结果不可核实，请人工处理。');
-      // Only backend-owned local sources/cards are currently verified. M2b needs
-      // its own deterministic evidence validation before enabling remote cards.
-      const local = this.dify instanceof LocalFallbackDifyClient;
+    const local = this.dify instanceof LocalFallbackDifyClient;
+    const finalize = (draft, semanticReview = null) => {
       const citations = local && draft.source ? [draft.source] : [];
-      const { audit: verdict, reply } = saveCompliance(this.store, actor, this.now, { originalText: text, draftReply: draft.answer, citations, clientId: clientId || null });
-      const record = { id: id('message'), tenantId: actor.tenantId, ownerId: actor.id, clientId: clientId || null, text, createdAt: iso(this.now()), isMock: true,
-        kind: local && draft.kind === 'extraction' ? 'extraction' : 'answer', engine: local ? 'local-fallback' : 'injected-test-client',
-        compliance: { decision: verdict.decision, rules: verdict.rules, auditId: verdict.auditId, ruleVersion: verdict.ruleVersion } };
-      if (local && draft.kind === 'extraction' && verdict.decision === 'allow') record.extraction = { ...draft.extraction, requiresConfirmation: true };
-      if (verdict.decision === 'block') {
-        record.blocked = true; record.answer = reply; record.source = '合规出口拦截';
-      } else {
-        record.answer = reply; if (local && draft.source) record.source = draft.source;
+      return this.store.transaction(() => {
+        if (!local && typeof draft.difyConversationId === 'string' && /^[\w-]{1,100}$/.test(draft.difyConversationId)) {
+          conversation.difyConversationId = draft.difyConversationId;
+          conversation.status = 'configured';
+          this.store.put('dify-conversation', conversation);
+        }
+        const { audit: verdict, reply } = saveCompliance(this.store, actor, this.now, { originalText: text, draftReply: draft.answer, citations,
+          clientId: clientId || null, semanticReview });
+        const record = { id: id('message'), tenantId: actor.tenantId, ownerId: actor.id, clientId: clientId || null, text, createdAt: iso(this.now()), isMock: local,
+          kind: local && draft.kind === 'extraction' ? 'extraction' : 'answer', engine: draft.engine || (local ? 'local-fallback' : 'dify'),
+          ...(draft.metadata ? { metadata: { intent: draft.metadata.intent, source: null } } : {}),
+          compliance: { decision: verdict.decision, rules: verdict.rules, auditId: verdict.auditId, ruleVersion: verdict.ruleVersion } };
+        if (local && draft.kind === 'extraction' && verdict.decision === 'allow') record.extraction = { ...draft.extraction, requiresConfirmation: true };
+        if (verdict.decision === 'block') {
+          record.blocked = true; record.answer = reply; record.source = '合规出口拦截';
+        } else {
+          record.answer = reply; if (local && draft.source) record.source = draft.source;
+        }
+        this.store.put('message', record);
+        this.audit(actor, verdict.decision === 'block' ? 'compliance.blocked' : 'compliance.allowed', record.id,
+          `出口审查：${verdict.decision}｜命中：${verdict.rules.join('、') || '无'}`, clientId || null);
+        return record;
+      });
+    };
+    const processDraft = draft => {
+      check(draft && typeof draft.answer === 'string' && draft.answer.trim() && draft.answer.length <= 3000, 502, 'DIFY_RESULT_INVALID', '助手结果不可核实，请人工处理。');
+      if (local) return finalize(draft);
+      const failClosed = () => {
+        this.auditDifyFailure(actor, 'compliance_guard');
+        return finalize(draft, { decision: 'block', rules: ['semantic-review-unavailable'], reply: null });
+      };
+      if (typeof this.dify.reviewCompliance !== 'function') return failClosed();
+      let review;
+      try {
+        review = this.dify.reviewCompliance({ draftReply: draft.answer, intent: draft.metadata?.intent || draft.kind || 'answer',
+          productId: product.id, channel: 'app', user: conversation.user });
+      } catch (error) {
+        this.auditDifyFailure(actor, 'compliance_guard');
+        throw this.safeDifyError(error);
       }
-      this.store.put('message', record);
-      this.audit(actor, verdict.decision === 'block' ? 'compliance.blocked' : 'compliance.allowed', record.id,
-        `出口审查：${verdict.decision}｜命中：${verdict.rules.join('、') || '无'}`, clientId || null);
-      return record;
+      const reviewFailed = error => {
+        this.auditDifyFailure(actor, 'compliance_guard');
+        if (error instanceof AppError && error.code === 'DIFY_APP_NOT_CONFIGURED') throw error;
+        return finalize(draft, { decision: 'block', rules: ['semantic-review-unavailable'], reply: null });
+      };
+      const reviewReceived = result => {
+        if (result?.rules?.includes('semantic-review-unavailable') || result?.rules?.includes('semantic-review-invalid')) {
+          this.auditDifyFailure(actor, 'compliance_guard');
+        }
+        return finalize(draft, result);
+      };
+      return review && typeof review.then === 'function'
+        ? review.then(reviewReceived, reviewFailed)
+        : reviewReceived(review);
+    };
+    let pending;
+    try { pending = this.dify.chat({ text, product, user: conversation.user, conversation_id: conversation.difyConversationId || null }); }
+    catch (error) { this.auditDifyFailure(actor, 'broker_assistant_chat'); throw this.safeDifyError(error); }
+    if (pending && typeof pending.then === 'function') return pending.then(processDraft).catch(error => {
+      if (!(error instanceof AppError && error.code === 'DIFY_APP_NOT_CONFIGURED')) this.auditDifyFailure(actor, 'broker_assistant_chat');
+      throw this.safeDifyError(error);
     });
-    return draft && typeof draft.then === 'function' ? draft.then(finish) : finish(draft);
+    try { return processDraft(pending); }
+    catch (error) {
+      if (!local && !(error instanceof AppError && error.code === 'DIFY_APP_NOT_CONFIGURED')) this.auditDifyFailure(actor, 'broker_assistant_chat');
+      throw this.safeDifyError(error);
+    }
   }
 }

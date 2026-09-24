@@ -106,6 +106,97 @@ test('assistant：出口审查在返回前完成，违规回复被拦并记审�
   store.close();
 });
 
+test('M2b：extract 使用后端 user，模型输出经过后端确定性重算，诚实标记 Dify 与非 mock', async () => {
+  let received;
+  const dify = {
+    isConfigured: true,
+    status: () => ({ dify: 'configured' }),
+    extractParams: async input => {
+      received = input;
+      return { params: { annualPremium: '99999999.99' }, evidence: { annualPremium: '模型编造' }, conflicts: [], missing: [] };
+    },
+    chat: () => ({ answer: 'ok' }),
+  };
+  const { service, store } = serviceWith(dify);
+  try {
+    const text = '陈先生 35 岁不吸烟，年缴 1 万美元，5 年缴';
+    const result = await service.extract(text, demoActors.broker);
+    assert.equal(received.text, text);
+    assert.equal(received.user, store.list('dify-conversation', demoActors.broker)[0]?.user);
+    assert.notEqual(received.user, 'caller-controlled-user');
+    assert.equal(result.params.age, 35);
+    assert.equal(result.params.smoker, false);
+    assert.equal(result.params.annualPremium, '10000.00');
+    assert.equal(result.evidence.annualPremium, '年缴 1 万');
+    assert.equal(result.isMock, false);
+    assert.equal(result.engine, 'dify');
+    assert.equal(store.list('job').length, 0);
+  } finally { store.close(); }
+});
+
+test('M2b：助手先完成语义审查再落审计与消息，语义层只能收紧判定', async () => {
+  let reviewSawNoMessage = false;
+  const dify = {
+    isConfigured: true,
+    status: () => ({ dify: 'configured' }),
+    chat: async ({ user, conversation_id }) => {
+      assert.match(user, /^dify-user-/);
+      assert.equal(conversation_id, null);
+      return { answer: '请由经纪在确认页复核参数。', kind: 'proposal', engine: 'dify',
+        metadata: { intent: 'proposal', source: null }, difyConversationId: 'dify-session-01' };
+    },
+    reviewCompliance: async input => {
+      assert.match(input.user, /^dify-user-/);
+      reviewSawNoMessage = store.list('message').length === 0;
+      return { decision: 'allow', rules: [], reply: null };
+    },
+    extractParams: async () => ({ params: {}, evidence: {}, conflicts: [], missing: [] }),
+  };
+  const { service, store } = serviceWith(dify);
+  try {
+    const allowed = await service.assistant(demoActors.broker, '生成计划书', null);
+    assert.equal(reviewSawNoMessage, true);
+    assert.equal(allowed.isMock, false);
+    assert.equal(allowed.engine, 'dify');
+    assert.equal(allowed.compliance.decision, 'allow');
+    assert.equal(store.list('compliance-audit').length, 1);
+    const conversation = store.list('dify-conversation', demoActors.broker)[0];
+    assert.equal(conversation.difyConversationId, 'dify-session-01');
+
+    dify.chat = async () => ({ answer: '保证赚，收益 8%。', kind: 'knowledge', engine: 'dify', metadata: { intent: 'knowledge', source: null } });
+    const blocked = await service.assistant(demoActors.broker, '这个产品怎么样', null);
+    assert.equal(blocked.compliance.decision, 'block');
+    assert.match(blocked.answer, /人工/);
+    assert.match(blocked.answer, /无法核实/);
+    assert.equal(blocked.isMock, false);
+  } finally { store.close(); }
+});
+
+test('M2b/RL-07：Dify 失败记安全审计，不回显上游错误原文、key 或 user 标识', async () => {
+  const upstreamSecret = 'offline-upstream-secret-not-for-output';
+  const dify = {
+    isConfigured: true,
+    status: () => ({ dify: 'configured' }),
+    chat: async () => { throw new Error(`transport failed: ${upstreamSecret} dify-user-private-id`); },
+    extractParams: async () => { throw new Error(`transport failed: ${upstreamSecret} dify-user-private-id`); },
+  };
+  const { service, store } = serviceWith(dify);
+  try {
+    await assert.rejects(service.assistant(demoActors.broker, '你好', null), error => {
+      assert.equal(error.code, 'DIFY_UNAVAILABLE');
+      assert.doesNotMatch(error.message, /upstream|secret|dify-user-private-id/i);
+      return true;
+    });
+    await assert.rejects(service.extract('陈先生35岁', demoActors.broker), error => error.code === 'DIFY_UNAVAILABLE');
+    const events = store.list('event', demoActors.broker).filter(event => event.type === 'dify.call-failed');
+    assert.equal(events.length, 2);
+    assert.ok(events.every(event => event.detail.includes('已省略上游错误详情')));
+    assert.doesNotMatch(JSON.stringify(events), new RegExp(upstreamSecret));
+    assert.doesNotMatch(JSON.stringify(events), /dify-user-private-id/);
+    assert.equal(store.list('message').length, 0);
+  } finally { store.close(); }
+});
+
 test('assistant：正常回复放行且带出处，抽取分支只给待确认参数', () => {
   const { service, store } = serviceWith(createDifyClient());
   const answer = service.assistant(demoActors.broker, '生成流程是什么样的', null);

@@ -29,7 +29,11 @@ const leaks = (haystack, text, baseline = '') => fragments(text).filter(fragment
 
 function remote(respond, apiKeys = KEYS) {
   const calls = [];
-  const transport = async (url, init) => { calls.push({ url, init }); return typeof respond === 'function' ? respond(url, init) : respond; };
+  const transport = async (url, init) => {
+    calls.push({ url, init });
+    if (url.endsWith('/workflows/run')) return { data: { outputs: { decision: 'allow', rules: [], reply: '' } } };
+    return typeof respond === 'function' ? respond(url, init) : respond;
+  };
   return { client: createDifyClient({ apiUrl: 'https://dify.invalid/v1', apiKeys, transport }), calls };
 }
 function local(dify) {
@@ -99,7 +103,7 @@ test('RL-01d：参数抽取附带回报率或利益金额，不进入任何参�
   // The same holds through the service seam and the assistant's parameter card.
   const { service, store } = local();
   try {
-    assert.equal(service.extract('陈先生35岁，每年2万回报').params.annualPremium, undefined);
+    assert.equal(service.extract('陈先生35岁，每年2万回报', demoActors.broker).params.annualPremium, undefined);
     const card = service.assistant(demoActors.broker, '陈先生35岁，每年2万美元分红', 'client-chen').extraction;
     assert.equal(card.params.annualPremium, undefined);
     assert.ok(card.conflicts.some(c => c.includes('利益表述')));
@@ -146,11 +150,13 @@ test('RL-02a／C04：无知识库时问产品事实回答“无法核实”、�
   const fake = local(remote({ answer: '根据条款，该产品第10年保证现金价值为 12,000 美元。', metadata: { intent: 'answer', source: '官方计划书 · 第 3 页' } }).client);
   try {
     const message = await fake.service.assistant(demoActors.broker, '这个产品有没有保证现金价值', null);
-    assert.equal(message.blocked, true);
-    assert.equal(message.source, '合规出口拦截');
+    assert.match(message.answer, /无法核实/);
+    assert.doesNotMatch(message.answer, /12,000|保证现金价值/);
+    assert.equal(message.compliance.decision, 'allow');
+    assert.equal(message.source, undefined);
     assert.ok(!JSON.stringify(message).includes('官方计划书 · 第 3 页'));
-    // Without numbers the reply passes the deterministic guard, but the model's own
-    // citation is still never shown as a source (semantic fact-checking is M2b/M3).
+    // Product-fact answers are replaced with the M2b no-KB fallback even if the
+    // model invents a value, omits the intent, or supplies a citation.
     fake.service.dify = remote({ answer: '请以保司官方资料为准。', metadata: { source: '官方条款 · 第 2 页' } }).client;
     const unsourced = await fake.service.assistant(demoActors.broker, '这个产品有没有保证现金价值', null);
     assert.equal(unsourced.compliance.decision, 'allow');
@@ -223,7 +229,8 @@ test('RL-04a：固定输出违规文本的探针经后端调用，前端只收�
     const bootBefore = (await ctx.request('/api/bootstrap', { headers: { cookie } })).text, dbBefore = dumpDatabase(ctx.store);
     const response = await ctx.post(cookie, '/api/assistant', { text: '请介绍一下', clientId: 'client-chen' });
     assert.equal(response.status, 200);
-    assert.equal(probe.calls.length, 1, 'the probe was really called through the backend');
+    assert.equal(probe.calls.filter(call => call.url.endsWith('/chat-messages')).length, 1, 'the chat probe was really called through the backend');
+    assert.equal(probe.calls.filter(call => call.url.endsWith('/workflows/run')).length, 1, 'the compliance workflow ran before the reply was returned');
     assert.equal(response.body.answer, MANUAL_REPLY);
     assert.equal(response.body.blocked, true);
     assert.deepEqual(leaks(response.text, PROBE), []);
@@ -322,7 +329,8 @@ test('RL-06：密钥与凭据不出现在前端响应、模型输入、存储与
     for (const text of ['password=demo-value', 'api_key=demo-value', 'Cookie: demo-value', `Bearer ${KEYS.chat}`]) {
       assert.equal((await ctx.post(cookie, '/api/assistant', { text, clientId: 'client-chen' })).body.error.code, 'SENSITIVE_INPUT');
     }
-    assert.equal(probe.calls.length, 1, 'credential-like input never reaches the model');
+    assert.equal(probe.calls.filter(call => call.url.endsWith('/chat-messages')).length, 1, 'credential-like input never reaches the chat model');
+    assert.equal(probe.calls.filter(call => call.url.endsWith('/workflows/run')).length, 1, 'only the safe candidate reaches semantic review');
     const boot = await ctx.request('/api/bootstrap', { headers: { cookie } });
     const modelInput = probe.calls.map(c => c.init.body).join('\n');
     for (const key of Object.values(KEYS)) {

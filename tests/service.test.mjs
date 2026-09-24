@@ -112,7 +112,7 @@ test('客户跟进采用乐观锁，防止两人覆盖更新', () => {
 
 test('本地提取器只抽参数，缺失字段和限制会明确返回', () => {
   const ctx = setup();
-  const result = ctx.service.extract('陈先生35岁不吸烟，年缴1万美元，5年缴');
+  const result = ctx.service.extract('陈先生35岁不吸烟，年缴1万美元，5年缴', demoActors.broker);
   assert.equal(result.params.age, 35);
   assert.equal(result.params.smoker, false);
   assert.equal(result.params.currency, 'USD');
