@@ -51,11 +51,33 @@ test('显式 dev 模式仅用 localhost 并按三个应用独立 key 配置，bo
       const cookie = session.headers.get('set-cookie');
       const boot = await fetch(origin + '/api/bootstrap', { headers: { cookie } });
       const payload = await boot.json();
-      console.log(JSON.stringify({ started: true, status: app.service.dify.status(), edition: payload.edition, mode: payload.integrations.difyMode }));
+      console.log(JSON.stringify({ started: true, status: app.service.dify.status(), edition: payload.edition, mode: payload.integrations.difyMode, extraction: payload.integrations.difyExtraction }));
     } finally { await app.close(); }
   `);
   assert.equal(outcome.started, true);
   assert.equal(outcome.status.dify, 'configured');
   assert.equal(outcome.edition, 'M2b 开发联调版');
   assert.equal(outcome.mode, 'development');
+  assert.equal(outcome.extraction, 'disabled');
+});
+
+test('Dify 参数抽取仅在开发模式显式 opt-in，缺独立 extract key 或开关值无效时拒绝', () => {
+  const base = {
+    HB_DIFY_MODE: 'dev', DIFY_API_URL: 'http://127.0.0.1:5001/v1',
+    DIFY_CHAT_API_KEY: 'offline-chat-key-0001', DIFY_EXTRACT_API_KEY: 'offline-extract-key-0002',
+    DIFY_COMPLIANCE_API_KEY: 'offline-compliance-key-0003',
+  };
+  const enabled = runApp({ ...base, HB_DIFY_EXTRACT_MODE: 'dev' }, `
+    import { createApp } from './server/index.mjs';
+    const app = createApp({ database: ':memory:', tick: false });
+    console.log(JSON.stringify({ started: true, enabled: app.service.difyExtractEnabled }));
+    app.store.close();
+  `);
+  assert.deepEqual(enabled, { started: true, enabled: true });
+  assert.deepEqual(runApp({ ...base, DIFY_EXTRACT_API_KEY: undefined, HB_DIFY_EXTRACT_MODE: 'dev' }),
+    { started: false, code: 'DIFY_EXTRACT_CONFIG_INVALID' });
+  assert.deepEqual(runApp({ ...base, HB_DIFY_EXTRACT_MODE: 'true' }),
+    { started: false, code: 'DIFY_EXTRACT_MODE_INVALID' });
+  assert.deepEqual(runApp({ HB_DIFY_MODE: 'dev', HB_STRICT_MODE: 'true', HB_DIFY_EXTRACT_MODE: 'dev' }),
+    { started: false, code: 'DIFY_STRICT_ONLY' });
 });

@@ -1,5 +1,6 @@
 import { AppError } from '../errors.mjs';
 import { evaluateCompliance, hasUnverifiedNumber } from './compliance.mjs';
+import { classifyIntent } from './intent-router.mjs';
 import { LocalFallbackDifyClient } from './local-fallback.mjs';
 
 // DifyClient — the backend's seam to the Dify apps (docs/dify-workflow-plan.md).
@@ -32,23 +33,16 @@ export const DIFY_APPS = Object.freeze({
 });
 // Environment variable names reserved for M2b. The default and strict application
 // modes reject every name in DIFY_ENV_VARS; only explicit localhost dev mode accepts them.
+// The proposal extractor is separately disabled unless HB_DIFY_EXTRACT_MODE=dev.
 export const DIFY_APP_KEY_ENV = Object.freeze({
   chat: 'DIFY_CHAT_API_KEY',
   extract: 'DIFY_EXTRACT_API_KEY',
   compliance: 'DIFY_COMPLIANCE_API_KEY',
 });
-export const DIFY_ENV_VARS = Object.freeze(['DIFY_API_URL', 'DIFY_API_KEY', ...Object.values(DIFY_APP_KEY_ENV)]);
+export const DIFY_ENV_VARS = Object.freeze(['DIFY_API_URL', 'DIFY_API_KEY', 'HB_DIFY_EXTRACT_MODE', ...Object.values(DIFY_APP_KEY_ENV)]);
 
 const notConfigured = app => new AppError(503, 'DIFY_APP_NOT_CONFIGURED', `Dify 应用 ${DIFY_APPS[app]} 未配置，该能力暂不可用，未调用 Dify。`);
 const validUser = value => typeof value === 'string' && /^[\w-]{1,100}$/.test(value);
-function inferIntent(text) {
-  const query = String(text ?? '').normalize('NFKC');
-  if (/进度|進度|任务状态|任務狀態|保单进展|保單進展/.test(query)) return 'progress';
-  if (/提醒|跟进|跟進|回访|回訪|联系|聯絡|联络/.test(query)) return 'followup';
-  if (/计划书|計劃書|建议书|建議書|出计划|出計劃|生成计划|生成計劃|直接(?:帮我)?提交|提交并忽略|马上生成/.test(query)) return 'proposal';
-  if (/条款|條款|投保|保费|保費|现金价值|現金價值|退保价值|退保價值|保障|收益|回报|回報|产品|產品/.test(query)) return 'knowledge';
-  return null;
-}
 
 async function fetchTransport(url, init) {
   const res = await fetch(url, init);
@@ -129,7 +123,7 @@ export class HttpDifyClient {
     // The Dify workflow may label a clear request as `unknown`. Preserve the
     // stable API taxonomy for unambiguous intents using a backend rule; only use
     // the model label where the backend has no matching rule.
-    let intent = inferIntent(text) || modelIntent;
+    let intent = classifyIntent(text) || modelIntent;
     if (!['proposal', 'progress', 'followup', 'knowledge', 'unknown'].includes(intent)) intent = 'unknown';
     // No knowledge base is configured in the M2b dev edition. Do not expose a
     // model-generated product-fact answer even if the prompt is ignored.

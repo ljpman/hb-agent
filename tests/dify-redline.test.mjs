@@ -153,14 +153,14 @@ test('RL-02a／C04：无知识库时问产品事实回答“无法核实”、�
     assert.match(message.answer, /无法核实/);
     assert.doesNotMatch(message.answer, /12,000|保证现金价值/);
     assert.equal(message.compliance.decision, 'allow');
-    assert.equal(message.source, undefined);
+    assert.match(message.source, /^演示资料边界：M3 知识库未接入$/);
     assert.ok(!JSON.stringify(message).includes('官方计划书 · 第 3 页'));
     // Product-fact answers are replaced with the M2b no-KB fallback even if the
     // model invents a value, omits the intent, or supplies a citation.
     fake.service.dify = remote({ answer: '请以保司官方资料为准。', metadata: { source: '官方条款 · 第 2 页' } }).client;
     const unsourced = await fake.service.assistant(demoActors.broker, '这个产品有没有保证现金价值', null);
     assert.equal(unsourced.compliance.decision, 'allow');
-    assert.equal(unsourced.source, undefined);
+    assert.match(unsourced.source, /^演示资料边界：M3 知识库未接入$/);
   } finally { fake.store.close(); }
 });
 
@@ -174,8 +174,8 @@ test('RL-02d：进度查询未接入时如实说明，不编造状态或更新�
     assert.equal(result.body.progress, null);
     assert.equal(result.body.updatedAt, null);
     assert.equal(result.body.source, null);
-    const message = await ctx.service.assistant(demoActors.broker, '帮我查下这个客户的进度', 'client-chen');
-    assert.match(message.answer, /无法核实/);
+    const message = await ctx.service.assistant(demoActors.broker, '帮我查下这个客户的保单／理赔进度', 'client-chen');
+    assert.match(message.answer, /真实保单／理赔进度查询尚未接入/);
     assert.ok(!NUMERIC.test(message.answer));
     for (const label of Object.values(statusLabels)) assert.ok(!message.answer.includes(label), label);
   } finally { await ctx.close(); }
@@ -347,13 +347,15 @@ test('RL-07：未接通或调用失败时如实标注，不把本地规则结果
     const cookie = await ctx.login();
     assert.equal((await ctx.request('/api/bootstrap', { headers: { cookie } })).body.integrations.dify, 'not-configured');
     const message = await ctx.service.assistant(demoActors.broker, '陈先生35岁不吸烟，年缴1万美元，5年缴', 'client-chen');
-    assert.equal(message.engine, 'local-fallback');
+    assert.equal(message.engine, 'local-rule-demo');
     assert.equal(message.extraction.engine, 'local-rule-demo');
     assert.equal(message.extraction.isMock, true);
     assert.match(message.extraction.warning, /未调用 Dify/);
     assert.match(renderAssistantReply(message, product.fields), /未调用 Dify/);
-    // A failed remote call is an error, never a quietly substituted local answer.
-    ctx.service.dify = remote(() => { throw new Error('offline'); }).client;
+    // Explicitly enable the retained candidate path: a failed opt-in remote call
+    // is an error, never a quietly substituted local answer.
+    ctx.service.difyExtractEnabled = true;
+    ctx.service.dify = createDifyClient({ apiUrl: 'https://dify.invalid/v1', apiKeys: KEYS, transport: async () => { throw new Error('offline'); } });
     const failed = await ctx.post(cookie, '/api/assistant', { text: '陈先生35岁不吸烟，年缴1万美元，5年缴', clientId: 'client-chen' });
     assert.equal(failed.body.error.code, 'DIFY_UNAVAILABLE');
     assert.ok(!/local-fallback|local-rule-demo/.test(failed.text));

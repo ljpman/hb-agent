@@ -225,7 +225,7 @@ test('C01／RL-04d：语义合规审查只作建议——异常、未知、不�
 
 test('M2b 预留的环境变量名：每个应用各一个 key 变量，统一列入拒绝清单', () => {
   assert.deepEqual(DIFY_APP_KEY_ENV, { chat: 'DIFY_CHAT_API_KEY', extract: 'DIFY_EXTRACT_API_KEY', compliance: 'DIFY_COMPLIANCE_API_KEY' });
-  assert.deepEqual([...DIFY_ENV_VARS].sort(), ['DIFY_API_KEY', 'DIFY_API_URL', 'DIFY_CHAT_API_KEY', 'DIFY_COMPLIANCE_API_KEY', 'DIFY_EXTRACT_API_KEY']);
+  assert.deepEqual([...DIFY_ENV_VARS].sort(), ['DIFY_API_KEY', 'DIFY_API_URL', 'DIFY_CHAT_API_KEY', 'DIFY_COMPLIANCE_API_KEY', 'DIFY_EXTRACT_API_KEY', 'HB_DIFY_EXTRACT_MODE']);
 });
 
 // Spawns the real application entry with one reserved Dify variable set and no network.

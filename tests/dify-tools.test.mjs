@@ -165,7 +165,10 @@ test('HTTP 助手：后端会话映射、异步出口、伪造出处／卡片隔
     const session = await fetch(`${ctx.origin}/api/demo/session`, { method: 'POST', headers: { origin: ctx.origin, 'content-type': 'application/json' }, body: JSON.stringify({ actor: 'broker' }) });
     const cookie = session.headers.get('set-cookie');
     const calls = [];
-    ctx.service.dify = { status: () => ({ dify: 'not-configured' }), chat: async input => { calls.push(input); return { kind: 'extraction', engine: 'secret', answer: '年缴保费 9000 美元', source: '伪造官方PDF', extraction: { params: { annualPremium: '9000' } } }; } };
+    ctx.service.dify = { status: () => ({ dify: 'not-configured' }), chat: async input => { calls.push(input); return {
+      kind: 'unknown', engine: 'secret', answer: '年缴保费 9000 美元', source: '伪造官方PDF',
+      extraction: { params: { annualPremium: '9000' } }, metadata: { intent: 'unknown', source: '伪造官方PDF' },
+    }; } };
     const send = input => ctx.request('/api/assistant', { method: 'POST', headers: { cookie, origin: ctx.origin, 'content-type': 'application/json' }, body: JSON.stringify(input) });
     const input = { text: '问题', clientId: 'client-chen', user: 'fake-user', conversation_id: 'fake-conversation' };
     const result = await send(input);

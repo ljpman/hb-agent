@@ -44,8 +44,8 @@
 - **Dify 离线加固（2026-09-23）**：出口／输入合规守卫识别香港身份证号（校验位确定性核对，规则版本 `m2a2-3`）；
   `DifyClient` 按应用分别配置 key（chat／extract／compliance），不共用、不顶替，缺哪个只那项报未配置；
   参数抽取不把"收益／回报"旁的金额当保费；RL 红线用例写成离线回归（`tests/dify-redline.test.mjs`）。
-- **M2b 开发联调版（2026-09-23）**：本机 Windows Dify 1.17.1 的三个 `hb-agent-dev-*` 工作流均已导入并发布（assistant v1、extract v2、compliance v3）；Dify UI 的 10 个虚构预览样例通过。根目录 `.env` 中开发模式、Dify 地址和三个独立应用 key 变量存在（只核验变量存在，不记录值）。Node 24 下真实后端 → Dify 验收最终 **116 项通过、0 项失败**，RL 红线每项重复 10 次（暂定值）；Docker API 容器可通过 `host.docker.internal` 到达只监听回环的临时探针。Dify → 后端工具调用尚未接通；正式 M2b 仍未完成。状态和逐轮失败记录见 [M2b 开发联调版记录](docs/m2b-dev.md)。
-- 验收基线：原有 199 项测试通过；本次改动后 Node 24 完整离线测试 **222 项通过、0 项失败**。本地 PDF smoke 已尝试但失败于 `PDF_GENERATION_FAILED`；当前缺少可用 Python（`python`／`python3` 是 WindowsApps 执行别名，未找到 `py.exe`），`npm` 也不可用；未安装软件。
+- **M2b 开发联调版（2026-09-24）**：本机 Windows Dify 1.17.1 的三个 `hb-agent-dev-*` 工作流保持已发布（assistant v1、extract v2、compliance v3）；上一轮真实验收 **116/116**、UI 预览 **10/10**。本轮完整真实重验历史 **136/137**（105 次请求：chat 22、extract 51、review 32）；I08 含糊案件问法经后端确定性路由后本机单例验收 **1/1**，该次 Dify 请求为 0；此前模型对该句曾返回 `unknown` 和 `progress`，因此不依赖模型分类。完整离线测试 **235/235**。抽取候选核实此前补充字段为 0，现默认停用；需同时显式 `HB_DIFY_MODE=dev` 与 `HB_DIFY_EXTRACT_MODE=dev` 才启用，应用和确定性核实实现保留，待真实多字段产品接入后再评估。后端先判明确意图、proposal 只返回待确认参数卡、计划书进度按经纪／租户隔离、followup 只读。开发版采用后端编排，不让 Dify 调用后端工具，gateway 校验保持不变；正式 M2b 仍未完成。详见 [M2b 开发联调版记录](docs/m2b-dev.md)。
+- 验收基线：本轮开始时 222 项全部通过；当前 Node 24 完整离线测试 **234 项通过、0 项失败**。本地 PDF smoke 曾失败于 `PDF_GENERATION_FAILED`；当时缺少可用 Python（`python`／`python3` 是 WindowsApps 执行别名，未找到 `py.exe`），未安装软件。
   详见 [接续与验收记录](docs/progress-2026-09-22.md)。
 
 **仍是 mock / 未接入**
@@ -53,7 +53,7 @@
   是骨架，**未连接任何真实香港端点，未声称支持任何真实保司**。
 - 真实文件交付（M1b 待补）：**没有任何真实产品的核验规则**（须按签认样本 `checklist.md` 编写），所以真实候选文件
   仍一律转人工；香港侧文件取回 `fetchArtifact` 无默认实现；真实任务讲解包未接入（`PACKAGE_NOT_READY`）。
-- 参数抽取 `extract()` / 知识问答 `assistant()`：开发模式已连接本机 Dify，按应用独立 key 调用三个开发工作流；`knowledge` 意图在无知识库时由后端强制返回“无法核实”，参数值由后端确定性规则重算。关闭开发模式或缺少配置时仍使用有限 `LocalFallbackDifyClient`，如实标注"未调用 Dify"。Dify → 后端工具调用和 M3 知识库未接入。联调记录见 [docs/m2b-dev.md](docs/m2b-dev.md)。
+- 参数抽取 `extract()` 默认只用后端确定性规则，标注 `engine=local-rule-demo`、`isMock=true`，不发送 extract 请求；候选核实代码和开发应用保留，只有开发模式显式设 `HB_DIFY_EXTRACT_MODE=dev` 才启用。原因是 E11 与此前候选核验累计补充 **0 个字段**，待真实多字段产品再评估。assistant 开发模式仍按独立 key 调用 chat/compliance；后端先判明确意图，proposal 返回未提交的待确认参数卡；Dify 无知识库时固定回答“无法核实”。计划书进度读取本人任务，保单／理赔进度未接入；followup 只读当前客户卡。开发版不由 Dify 调用后端工具，M3 知识库未接入。联调记录见 [docs/m2b-dev.md](docs/m2b-dev.md)。
 - 香港 Python、真实保司门户、真实 Dify 实例、知识库、APP IM：未接入。`/api/bootstrap` 诚实返回
   `python: awaiting-hong-kong / configured`、`dify: not-configured / partially-configured / configured`、`im: prototype-only`。
 - M2a-2 应用入口拒绝任一预留 Dify 环境变量（`DIFY_ENV_VARS`），正常运行只返回 `dify: not-configured`；
@@ -96,7 +96,7 @@
     鉴权网关：短期令牌、后端校验身份/数据范围、`user`/`conversation_id` 后端维护映射）— ✅ **离线部分已完成**。
     工作台已接合规判定／参数卡／出处；M2a-2 验收时 35 项离线测试通过。真实进度与真实 Dify 部署仍未完成。
   - **M2b 正式验收**（审批过的香港 Dify 实例 + DeepSeek + 三工作流 DSL 部署 + API key）— ⏳ **未完成**。
-    **M2b 开发联调版**（同一 Windows 电脑上的本机 Dify，虚构数据）— 🟡 **后端 → Dify 验收完成；Dify → 后端工具未完成**：开发模式仅允许 localhost、按应用分 key、后端身份映射、失败审计、无知识库固定答复及仅可收紧的出口审查已落地；真实脚本 116/116 通过，UI 预览 10/10 通过，完整离线测试 222/222 通过。短期工具令牌不能安全传入 Dify 运行而不进入工作流日志，因此未接工具调用，未放宽 gateway。正式 M2b 仍未完成。当前记录：[docs/m2b-dev.md](docs/m2b-dev.md)。
+    **M2b 开发联调版**（同一 Windows 电脑上的本机 Dify，虚构数据）— 🟡 **上一轮后端 → Dify 验收 116/116；本轮完整真实重验历史 136/137（105 次请求）；I08 确定性后端复测 1/1（Dify 请求 0）；离线测试 235/235**：三个 `hb-agent-dev-*` 应用保持已发布；I08 直接由后端给出本人计划书任务状态和保单／理赔未接入提示，不依赖曾出现波动的模型意图分类。E11 与既有候选核验没有补充字段（0）；extract Dify 默认关闭，显式开发开关、应用和核实代码保留，待真实多字段产品再评估。开发版由后端编排审计和进度，不在 Dify workflow 传递短期令牌或加入工具节点；gateway 未放宽。正式 M2b 仍未完成。当前记录：[docs/m2b-dev.md](docs/m2b-dev.md)。
     环境请求单、隐私审批问题、验收规划见 [docs/handoff/m2b-m3/](docs/handoff/m2b-m3/request-dify.md)。
 - **M3 · 知识库**（产品条款、操作流程、合规红线、门户手册；带来源、版本、失效日期）— 未开始。
   知识问答分支依赖知识库，在 M3 验收；资料接收规范见 [kb-intake](docs/handoff/m2b-m3/kb-intake.md)。

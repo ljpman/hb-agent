@@ -30,22 +30,25 @@ function exportedPackage(pack, client) {
 
 function difyRuntime(env) {
   const mode = env.HB_DIFY_MODE || '';
+  const extractMode = env.HB_DIFY_EXTRACT_MODE || '';
   const strict = env.NODE_ENV === 'production' || env.HB_STRICT_MODE === 'true';
   const present = DIFY_ENV_VARS.filter(name => Object.hasOwn(env, name));
   if (strict) {
     check(mode !== 'dev' && present.length === 0, 500, 'DIFY_STRICT_ONLY', '严格或 production 模式拒绝所有 Dify 配置。');
-    return { client: createDifyClient(), dev: false };
+    return { client: createDifyClient(), dev: false, difyExtractEnabled: false };
   }
   check(mode === '' || mode === 'dev', 500, 'DIFY_MODE_INVALID', 'HB_DIFY_MODE 只接受显式值 dev。');
   if (mode !== 'dev') {
     check(present.length === 0, 500, 'DIFY_OFFLINE_ONLY', '默认离线模式拒绝所有 Dify 环境变量；联调需显式设置 HB_DIFY_MODE=dev。');
-    return { client: createDifyClient(), dev: false };
+    return { client: createDifyClient(), dev: false, difyExtractEnabled: false };
   }
+  check(extractMode === '' || extractMode === 'dev', 500, 'DIFY_EXTRACT_MODE_INVALID', 'HB_DIFY_EXTRACT_MODE 只接受显式值 dev。');
   check(!present.includes('DIFY_API_KEY'), 500, 'DIFY_KEY_AMBIGUOUS', '开发联调只接受按应用区分的 Dify key。');
   const apiUrl = env.DIFY_API_URL || null;
   const apiKeys = Object.fromEntries(Object.entries(DIFY_APP_KEY_ENV).map(([app, name]) => [app, env[name] || undefined]));
   const hasKey = Object.values(apiKeys).some(Boolean);
   check(!hasKey || apiUrl, 500, 'DIFY_CONFIG_INVALID', '配置 Dify 应用 key 时必须同时配置本机 DIFY_API_URL。');
+  if (extractMode === 'dev') check(apiUrl && apiKeys.extract, 500, 'DIFY_EXTRACT_CONFIG_INVALID', '启用 Dify 参数候选核实时必须配置本机 DIFY_API_URL 和独立的 proposal_extract key。');
   if (apiUrl) {
     let parsed;
     try { parsed = new URL(apiUrl); } catch { throw new AppError(500, 'DIFY_URL_INVALID', '开发联调 Dify 地址无效。'); }
@@ -53,7 +56,7 @@ function difyRuntime(env) {
       !parsed.username && !parsed.password && !parsed.search && !parsed.hash && (!parsed.pathname || parsed.pathname === '/' || parsed.pathname === '/v1'),
     500, 'DIFY_URL_NOT_LOCAL', '开发联调只允许本机 localhost 或 127.0.0.1 Dify 地址。');
   }
-  return { client: createDifyClient({ apiUrl, apiKeys }), dev: true };
+  return { client: createDifyClient({ apiUrl, apiKeys }), dev: true, difyExtractEnabled: extractMode === 'dev' };
 }
 
 export function createApp({ database = process.env.HB_DATABASE || resolve(root, 'data/prototype.sqlite'), tick = true, serviceOptions = {}, env = process.env } = {}) {
@@ -61,7 +64,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
   const difyConfig = difyRuntime(env);
   const registry = createAdapterRegistry({ pythonAdapterUrl: env.HB_PYTHON_ADAPTER_URL || null, strict: env.HB_STRICT_MODE === 'true' });
   const dify = difyConfig.client;
-  const store = new Store(database); const service = new Service(store, { registry, dify, ...serviceOptions });
+  const store = new Store(database); const service = new Service(store, { ...serviceOptions, registry, dify, difyExtractEnabled: difyConfig.difyExtractEnabled });
   const interval = tick ? setInterval(() => service.tick().catch(() => {}), 300) : null;
   interval?.unref();
   const server = createServer(async (req, res) => {
@@ -114,7 +117,7 @@ export function createApp({ database = process.env.HB_DATABASE || resolve(root, 
           knowledge: demoKnowledge, statusLabels, followupStages,
           edition: difyConfig.dev ? 'M2b 开发联调版' : '本地离线演示版',
           integrations: { python: service.registry.status().python, dify: service.dify.status().dify,
-            difyMode: difyConfig.dev ? 'development' : 'offline', im: 'prototype-only' }
+            difyMode: difyConfig.dev ? 'development' : 'offline', difyExtraction: difyConfig.difyExtractEnabled ? 'enabled' : 'disabled', im: 'prototype-only' }
         });
         if (path === '/api/products' && req.method === 'GET') return json(200, { products: [product] });
         if (path === `/api/products/${product.id}/schema` && req.method === 'GET') return json(200, product);

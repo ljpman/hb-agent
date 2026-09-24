@@ -67,10 +67,45 @@ export function extractParameters(text, product) {
   collect('paymentTerm', [...text.matchAll(/(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*年(?:缴|繳|交)|(?:缴费|繳費|交费|交費|缴|繳|交)\s*([+-]?\d+(?:\.\d+)?)\s*年/g)], m => {
     const raw = m[1] || m[2]; return /^\d+$/.test(raw) ? String(Number(raw)) : undefined;
   });
-  return { productId: product.id, schemaVersion: product.schemaVersion, params, evidence, conflicts,
+  return { productId: product.id, schemaVersion: product.schemaVersion, params, evidence,
+    sources: Object.fromEntries(Object.keys(params).map(key => [key, 'rule'])), conflicts,
     missing: product.fields.filter(field => field.required && params[field.key] === undefined).map(field => field.key),
     requiresConfirmation: true, isMock: true, engine: 'local-rule-demo',
     warning: '当前使用有限规则演示提取，未调用 Dify 或大模型。未识别或有冲突的字段需经纪手动确认。' };
+}
+
+// Parse one exact piece of user evidence. The normal local extractor is tried
+// first; narrowly broader labelled forms allow a Dify candidate to fill a field
+// the whole-message rule pass missed without trusting a model-produced value.
+export function parseEvidenceValue(key, evidence, product) {
+  if (typeof evidence !== 'string' || !evidence.trim() || !product.fields.some(field => field.key === key)) return undefined;
+  const parsed = extractParameters(evidence, product);
+  const field = product.fields.find(item => item.key === key);
+  if (parsed.conflicts.some(conflict => conflict.startsWith(field.label))) return undefined;
+  if (Object.hasOwn(parsed.params, key)) return parsed.params[key];
+
+  const text = evidence.normalize('NFKC');
+  if (key === 'age') {
+    const values = [...text.matchAll(/(?:年龄|年齡|年岁|年歲)\s*(?:是|为|為|[:：])?\s*(\d{1,3})(?:\s*[岁歲])?/g)].map(match => Number(match[1]));
+    return values.length === 1 ? values[0] : undefined;
+  }
+  if (key === 'gender') {
+    const values = [...text.matchAll(/被(?:保险|保險)人(?:性别|性別)?\s*(?:是|为|為|[:：])\s*(男|女)/g)].map(match => match[1]);
+    return values.length === 1 ? values[0] : undefined;
+  }
+  if (key === 'annualPremium') {
+    const values = [...text.matchAll(/(?:年缴|年繳|年交|每年)(?:保费|保費)?\s*(?:(?:USD|HKD|美元|美金|港币|港幣|港元)\s*)?([+-]?\d[\d,.]*(?:[eE][+-]?\d+)?)\s*(万|萬)?/gi)];
+    if (values.length !== 1 || nearBenefit(text, values[0])) return undefined;
+    const [, raw, tenThousand] = values[0];
+    if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(raw)) return undefined;
+    const cents = decimalCents(raw.replaceAll(',', '')) * (tenThousand ? 10000n : 1n);
+    return `${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
+  }
+  if (key === 'paymentTerm') {
+    const values = [...text.matchAll(/(?:缴费|繳費|交费|交費)(?:年期|期限)\s*(?:是|为|為|[:：])?\s*(\d+)\s*年/g)].map(match => String(Number(match[1])));
+    return values.length === 1 ? values[0] : undefined;
+  }
+  return undefined;
 }
 
 function decimalCents(value) {

@@ -9,10 +9,10 @@ import { createDifyClient, HttpDifyClient } from '../server/dify/dify-client.mjs
 import { LocalFallbackDifyClient } from '../server/dify/local-fallback.mjs';
 import { spawnSync } from 'node:child_process';
 
-function serviceWith(dify) {
+function serviceWith(dify, options = {}) {
   let clock = Date.parse('2026-09-22T01:00:00.000Z');
   const store = new Store(':memory:');
-  const service = new Service(store, { now: () => clock, stepMs: 0, dify });
+  const service = new Service(store, { now: () => clock, stepMs: 0, dify, ...options });
   return { service, store };
 }
 
@@ -97,7 +97,7 @@ test('assistant：出口审查在返回前完成，违规回复被拦并记审�
     extractParams: () => ({}),
   };
   const { service, store } = serviceWith(badDify);
-  const record = service.assistant(demoActors.broker, '这产品怎么样', null);
+  const record = service.assistant(demoActors.broker, '你好，请给我一句欢迎语', null);
   assert.equal(record.blocked, true);
   assert.match(record.answer, /人工/);
   assert.equal(record.compliance.decision, 'block');
@@ -117,7 +117,7 @@ test('M2b：extract 使用后端 user，模型输出经过后端确定性重算�
     },
     chat: () => ({ answer: 'ok' }),
   };
-  const { service, store } = serviceWith(dify);
+  const { service, store } = serviceWith(dify, { difyExtractEnabled: true });
   try {
     const text = '陈先生 35 岁不吸烟，年缴 1 万美元，5 年缴';
     const result = await service.extract(text, demoActors.broker);
@@ -142,8 +142,8 @@ test('M2b：助手先完成语义审查再落审计与消息，语义层只能�
     chat: async ({ user, conversation_id }) => {
       assert.match(user, /^dify-user-/);
       assert.equal(conversation_id, null);
-      return { answer: '请由经纪在确认页复核参数。', kind: 'proposal', engine: 'dify',
-        metadata: { intent: 'proposal', source: null }, difyConversationId: 'dify-session-01' };
+      return { answer: '你好，我可以协助整理工作流程。', kind: 'unknown', engine: 'dify',
+        metadata: { intent: 'unknown', source: null }, difyConversationId: 'dify-session-01' };
     },
     reviewCompliance: async input => {
       assert.match(input.user, /^dify-user-/);
@@ -154,7 +154,7 @@ test('M2b：助手先完成语义审查再落审计与消息，语义层只能�
   };
   const { service, store } = serviceWith(dify);
   try {
-    const allowed = await service.assistant(demoActors.broker, '生成计划书', null);
+    const allowed = await service.assistant(demoActors.broker, '你好，请给我一句欢迎语', null);
     assert.equal(reviewSawNoMessage, true);
     assert.equal(allowed.isMock, false);
     assert.equal(allowed.engine, 'dify');
@@ -163,8 +163,8 @@ test('M2b：助手先完成语义审查再落审计与消息，语义层只能�
     const conversation = store.list('dify-conversation', demoActors.broker)[0];
     assert.equal(conversation.difyConversationId, 'dify-session-01');
 
-    dify.chat = async () => ({ answer: '保证赚，收益 8%。', kind: 'knowledge', engine: 'dify', metadata: { intent: 'knowledge', source: null } });
-    const blocked = await service.assistant(demoActors.broker, '这个产品怎么样', null);
+    dify.chat = async () => ({ answer: '保证赚，收益 8%。', kind: 'unknown', engine: 'dify', metadata: { intent: 'unknown', source: null } });
+    const blocked = await service.assistant(demoActors.broker, '请给我一个通用欢迎语', null);
     assert.equal(blocked.compliance.decision, 'block');
     assert.match(blocked.answer, /人工/);
     assert.match(blocked.answer, /无法核实/);
@@ -180,7 +180,7 @@ test('M2b/RL-07：Dify 失败记安全审计，不回显上游错误原文、key
     chat: async () => { throw new Error(`transport failed: ${upstreamSecret} dify-user-private-id`); },
     extractParams: async () => { throw new Error(`transport failed: ${upstreamSecret} dify-user-private-id`); },
   };
-  const { service, store } = serviceWith(dify);
+  const { service, store } = serviceWith(dify, { difyExtractEnabled: true });
   try {
     await assert.rejects(service.assistant(demoActors.broker, '你好', null), error => {
       assert.equal(error.code, 'DIFY_UNAVAILABLE');

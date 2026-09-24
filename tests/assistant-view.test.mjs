@@ -21,6 +21,25 @@ test('助手视图：真实后端抽取结果保留 false、输入金额、缺�
   } finally { store.close(); }
 });
 
+test('助手视图：逐字段标记 Dify 核实来源；无法核实值不显示且仍待确认', () => {
+  const html = renderAssistantReply({
+    id: 'm-dify-extract', answer: '已整理待确认参数卡。', engine: 'dify', isMock: false,
+    source: 'Dify 识别、后端核实；参数待确认',
+    compliance: { decision: 'allow', auditId: 'audit-demo', rules: [] },
+    extraction: {
+      params: { gender: '女' }, evidence: { gender: '被保险人性别是女' },
+      sources: { gender: 'dify-verified' }, unverified: ['age'],
+      warning: 'Dify 只提供候选；无法核实的候选已留空。', requiresConfirmation: true,
+      engine: 'dify', isMock: false,
+    },
+  }, product.fields);
+  assert.match(html, /Dify 识别、后端核实/);
+  assert.match(html, /模型识别到但无法核实，请手动填写/);
+  assert.match(html, /参数待确认 · 未提交/);
+  assert.match(html, /Dify 只提供候选/);
+  assert.ok(!html.includes('36'), 'unverified model candidate values are not displayed');
+});
+
 test('助手视图：block 不渲染危险回复、假出处与抽取按钮；所有动态文本转义', () => {
   const injection = '<img src=x onerror=alert(1)>';
   const message = { id: 'demo', answer: injection, source: injection, compliance: { decision: 'block', auditId: injection, rules: [injection] }, extraction: { params: { annualPremium: '99999' } } };
